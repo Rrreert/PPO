@@ -17,16 +17,16 @@ from networks import (
 
 # ─── PPO 超参数 ─────────────────────────────────────────────────────
 LR           = 3e-4
-GAMMA        = 0.99
-GAE_LAMBDA   = 0.95
+GAMMA        = 1.0    # 核心修复：调度是单次完整任务，不应折扣
+GAE_LAMBDA   = 1.0    # lambda=1.0 = Monte Carlo 回报，消除时序偏差
 CLIP_EPS     = 0.2
-ENTROPY_COEF = 0.02
+ENTROPY_COEF = 0.01   # 略微提高
 VF_COEF      = 0.5
 MAX_GRAD_NORM= 0.5
-PPO_EPOCHS   = 2
-MINI_BATCH   = 128
-COLLECT_INTERVAL = 4   # 每收集4个episode的轨迹后做一次PPO更新
-SHAPING_WEIGHT = 0.3
+PPO_EPOCHS   = 4      # 增加更新轮数
+MINI_BATCH   = 256
+COLLECT_INTERVAL = 8  # 从16降到8，更频繁更新
+REWARD_SCALE = 1e5    # 新增这个常量
 
 
 class PPOTrainer:
@@ -154,26 +154,21 @@ class PPOTrainer:
         if n == 0:
             return [], []
         
-        # ③ 修复：把终端奖励广播到每一步，加入步进塑形
+        # 缩放 reward，把 -4e5 压到 -4.0 量级
+        scaled_reward = final_reward / REWARD_SCALE
+        
         rewards_list = [0.0] * n
-        rewards_list[-1] = final_reward   # 终端奖励
-        
-        # 塑形奖励：每步根据已完成工序数给小正信号
-        # 这让 GAE 有非零 delta 可以传播
-        for t_idx in range(n - 1):
-            # 每完成一个 dispatch 给一个小的进度奖励
-            rewards_list[t_idx] = SHAPING_WEIGHT * (final_reward / max(n, 1))
-        
+        rewards_list[-1] = scaled_reward
         values = [t['value'].item() for t in trajectory]
-        
+    
         advantages = [0.0] * n
         gae = 0.0
         for t in reversed(range(n)):
             next_val = values[t + 1] if t + 1 < n else 0.0
             delta = rewards_list[t] + GAMMA * next_val - values[t]
-            gae = delta + GAMMA * GAE_LAMBDA * gae
+            gae   = delta + GAMMA * GAE_LAMBDA * gae
             advantages[t] = gae
-        
+    
         returns = [adv + val for adv, val in zip(advantages, values)]
         return advantages, returns
 
