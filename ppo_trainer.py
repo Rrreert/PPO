@@ -245,7 +245,7 @@ class PPOTrainer:
         buf_adv_o,  buf_adv_m  = [], []
         buf_ret_o,  buf_ret_m  = [], []
 
-        ENTROPY_START = 0.05   # 起始熵系数
+        ENTROPY_START = 0.1   # 起始熵系数
         ENTROPY_END   = 0.005  # 终态熵系数
 
         for ep in range(1, n_episodes + 1):
