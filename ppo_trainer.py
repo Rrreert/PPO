@@ -16,7 +16,7 @@ from networks import (
 )
 
 # ─── PPO 超参数 ─────────────────────────────────────────────────────
-LR           = 1e-4
+LR           = 3e-4
 GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
 CLIP_EPS     = 0.2
