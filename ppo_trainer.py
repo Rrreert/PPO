@@ -16,16 +16,16 @@ from networks import (
 )
 
 # ─── PPO 超参数 ─────────────────────────────────────────────────────
-LR           = 3e-4
+LR           = 1e-4
 GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
 CLIP_EPS     = 0.2
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.005
 VF_COEF      = 0.5
 MAX_GRAD_NORM= 0.5
 PPO_EPOCHS   = 2
 MINI_BATCH   = 128
-COLLECT_INTERVAL = 4   # 每收集4个episode的轨迹后做一次PPO更新
+COLLECT_INTERVAL = 8   # 每收集4个episode的轨迹后做一次PPO更新
 
 
 class PPOTrainer:
