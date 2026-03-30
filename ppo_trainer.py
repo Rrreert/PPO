@@ -20,12 +20,13 @@ LR           = 3e-4
 GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
 CLIP_EPS     = 0.2
-ENTROPY_COEF = 0.005
+ENTROPY_COEF = 0.02
 VF_COEF      = 0.5
 MAX_GRAD_NORM= 0.5
 PPO_EPOCHS   = 2
-MINI_BATCH   = 512
-COLLECT_INTERVAL = 16   # 每收集16个episode的轨迹后做一次PPO更新
+MINI_BATCH   = 128
+COLLECT_INTERVAL = 4   # 每收集4个episode的轨迹后做一次PPO更新
+SHAPING_WEIGHT = 0.3
 
 
 class PPOTrainer:
@@ -152,23 +153,32 @@ class PPOTrainer:
         n = len(trajectory)
         if n == 0:
             return [], []
+        
+        # ③ 修复：把终端奖励广播到每一步，加入步进塑形
         rewards_list = [0.0] * n
-        rewards_list[-1] = final_reward   # 仅终端有奖励
+        rewards_list[-1] = final_reward   # 终端奖励
+        
+        # 塑形奖励：每步根据已完成工序数给小正信号
+        # 这让 GAE 有非零 delta 可以传播
+        for t_idx in range(n - 1):
+            # 每完成一个 dispatch 给一个小的进度奖励
+            rewards_list[t_idx] = SHAPING_WEIGHT * (final_reward / max(n, 1))
+        
         values = [t['value'].item() for t in trajectory]
-
+        
         advantages = [0.0] * n
         gae = 0.0
         for t in reversed(range(n)):
-            next_val = values[t+1] if t+1 < n else 0.0
+            next_val = values[t + 1] if t + 1 < n else 0.0
             delta = rewards_list[t] + GAMMA * next_val - values[t]
-            gae   = delta + GAMMA * GAE_LAMBDA * gae
+            gae = delta + GAMMA * GAE_LAMBDA * gae
             advantages[t] = gae
-
+        
         returns = [adv + val for adv, val in zip(advantages, values)]
         return advantages, returns
 
     # ──────────────────────────────────────────────────────────────
-    def _ppo_update(self, net, optimizer, trajectory, advantages, returns, is_order):
+    def _ppo_update(self, net, optimizer, trajectory, advantages, returns, is_order, entropy_coef=ENTROPY_COEF):
         """PPO 更新（全局归一化优势，批量前向加速）。"""
         if not trajectory:
             return 0.0, 0.0
@@ -212,7 +222,7 @@ class PPOTrainer:
                 pg_loss = torch.stack(pg_losses).mean()
                 vf_loss = torch.stack(vf_losses).mean()
                 ent     = torch.stack(entropies).mean()
-                loss    = pg_loss + VF_COEF * vf_loss - ENTROPY_COEF * ent
+                loss    = pg_loss + VF_COEF * vf_loss - entropy_coef * ent
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -235,7 +245,13 @@ class PPOTrainer:
         buf_adv_o,  buf_adv_m  = [], []
         buf_ret_o,  buf_ret_m  = [], []
 
+        ENTROPY_START = 0.05   # 起始熵系数
+        ENTROPY_END   = 0.005  # 终态熵系数
+
         for ep in range(1, n_episodes + 1):
+            # 线性退火熵系数
+            alpha = ep / n_episodes
+            current_entropy_coef = ENTROPY_START * (1 - alpha) + ENTROPY_END * alpha
             reward, makespan, mto_d, mts_d, traj_o, traj_m, env = self._run_episode()
 
             adv_o, ret_o = self._compute_returns(traj_o, reward)
