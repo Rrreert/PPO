@@ -1,305 +1,465 @@
 """
-PPO 训练器：双智能体协同，事件驱动调度
+PPO 训练模块
+实现双智能体 PPO 训练流程：
+- 事件驱动的 episode 采样
+- GAE 优势估计
+- 裁剪式 PPO 更新
+- 完整的训练日志记录
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from torch.distributions import Categorical
+from collections import defaultdict
 
-from environment import ShopFloorEnv
-from networks import (
-    OrderSelectionNet, MachineAssignmentNet,
-    compute_order_heuristics, compute_machine_heuristics, state_to_tensors,
-    DEVICE
+from ppo_network import (
+    OrderSelectionPPO, MachineAssignPPO,
+    state_to_tensors,
+    ORDER_FEAT_DIM, MACHINE_FEAT_DIM, GLOBAL_FEAT_DIM,
+    ORDER_HEURISTIC_DIM, MACHINE_HEURISTIC_DIM
 )
-
-# ─── PPO 超参数 ─────────────────────────────────────────────────────
-LR           = 3e-4
-GAMMA        = 1.0    # 核心修复：调度是单次完整任务，不应折扣
-GAE_LAMBDA   = 1.0    # lambda=1.0 = Monte Carlo 回报，消除时序偏差
-CLIP_EPS     = 0.2
-ENTROPY_COEF = 0.01   # 略微提高
-VF_COEF      = 0.5
-MAX_GRAD_NORM= 0.5
-PPO_EPOCHS   = 4      # 增加更新轮数
-MINI_BATCH   = 256
-COLLECT_INTERVAL = 8  # 从16降到8，更频繁更新
-REWARD_SCALE = 1e5    # 新增这个常量
+from environment import SchedulingEnv, STAGE_INDEX, STATUS_WAITING
 
 
+# ─── PPO 超参数 ───────────────────────────────────────────────────────────────
+class PPOConfig:
+    lr_order = 3e-4
+    lr_machine = 3e-4
+    gamma = 0.99
+    gae_lambda = 0.95
+    clip_eps = 0.2
+    entropy_coef = 0.01
+    value_coef = 0.5
+    max_grad_norm = 0.5
+    n_epochs = 4         # 每次更新的 epoch 数
+    batch_size = 32
+    n_episodes_per_update = 5   # 每次更新收集的 episode 数
+
+
+# ─── 经验缓冲区 ───────────────────────────────────────────────────────────────
+class RolloutBuffer:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.order_transitions = []    # 订单选择智能体的转移
+        self.machine_transitions = []  # 设备分配智能体的转移
+
+    def add_order(self, order_feats, machine_mean, global_feat,
+                  heuristic_scores, action_idx, log_prob, value, reward, done):
+        self.order_transitions.append({
+            'order_feats': order_feats,
+            'machine_mean': machine_mean,
+            'global_feat': global_feat,
+            'heuristic_scores': heuristic_scores,
+            'action_idx': action_idx,
+            'log_prob': log_prob,
+            'value': value,
+            'reward': reward,
+            'done': done,
+        })
+
+    def add_machine(self, order_feat, machine_feats, global_feat,
+                    heuristic_scores, action_idx, log_prob, value, reward, done):
+        self.machine_transitions.append({
+            'order_feat': order_feat,
+            'machine_feats': machine_feats,
+            'global_feat': global_feat,
+            'heuristic_scores': heuristic_scores,
+            'action_idx': action_idx,
+            'log_prob': log_prob,
+            'value': value,
+            'reward': reward,
+            'done': done,
+        })
+
+
+def compute_gae(rewards, values, dones, gamma, gae_lambda):
+    """计算 GAE 优势估计"""
+    n = len(rewards)
+    advantages = np.zeros(n, dtype=np.float32)
+    returns = np.zeros(n, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(n)):
+        if dones[t]:
+            next_val = 0.0
+        else:
+            next_val = values[t + 1] if t + 1 < n else 0.0
+        delta = rewards[t] + gamma * next_val - values[t]
+        gae = delta + gamma * gae_lambda * (1 - dones[t]) * gae
+        advantages[t] = gae
+        returns[t] = advantages[t] + values[t]
+    return advantages, returns
+
+
+# ─── 主训练器 ─────────────────────────────────────────────────────────────────
 class PPOTrainer:
-    def __init__(self, data):
+    def __init__(self, data, config=None, device=None):
         self.data = data
-        self.order_net   = OrderSelectionNet().to(DEVICE)
-        self.machine_net = MachineAssignmentNet().to(DEVICE)
+        self.config = config or PPOConfig()
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"训练设备: {self.device}")
 
-        self.opt_order   = optim.Adam(self.order_net.parameters(),   lr=LR)
-        self.opt_machine = optim.Adam(self.machine_net.parameters(), lr=LR)
+        self.env = SchedulingEnv(data)
 
-        # 记录训练曲线
-        self.history = {
-            'reward': [], 'makespan': [], 'mto_delay': [], 'mts_delay': [],
-            'loss_order': [], 'loss_machine': [],
-            'entropy_order': [], 'entropy_machine': [],
-        }
+        self.order_agent = OrderSelectionPPO().to(self.device)
+        self.machine_agent = MachineAssignPPO().to(self.device)
 
-    # ──────────────────────────────────────────────────────────────
-    def _run_episode(self, collect=True):
-        """
-        运行一个完整调度 episode。
-        collect=True 时收集轨迹用于训练。
-        返回 (reward, makespan, mto_delay, mts_delay, trajectories)
-        """
-        env = ShopFloorEnv(self.data)
-        state = env.reset()
+        self.order_optimizer = optim.Adam(self.order_agent.parameters(), lr=self.config.lr_order)
+        self.machine_optimizer = optim.Adam(self.machine_agent.parameters(), lr=self.config.lr_machine)
 
-        # 轨迹缓冲区
-        traj_order   = []   # (of, df, gf, cand_idx, h_scores, action, log_prob, value)
-        traj_machine = []
+        # 训练记录
+        self.history = defaultdict(list)
 
-        while not env.is_done():
-            schedulable = env.get_schedulable()
+    # ─── Episode 采样 ─────────────────────────────────────────────────────────
+    def collect_episode(self):
+        """运行一个完整 episode，收集轨迹"""
+        state = self.env.reset()
+        buffer = RolloutBuffer()
+        total_decisions = 0
+        max_steps = 10000  # 防死循环保护
 
-            if not schedulable:
-                # 没有可调度任务，推进时间
-                t = env.advance_time()
-                if t is None:
-                    break
-                state = env._get_state()
+        for _ in range(max_steps):
+            if self.env.is_done():
+                break
+
+            available = self.env._get_available_orders()
+            if not available:
+                # 没有可调度订单，推进时间到下一事件
+                self.env.step_to_next_event()
+                state = self.env._get_state()
                 continue
 
-            # 事件驱动决策循环
-            while schedulable:
-                of, df, gf = state_to_tensors(state)
+            tensors = state_to_tensors(state, self.device)
+            global_feat = tensors['global_features']
+            all_machine_feats = tensors['machine_features']
+            machine_mean = all_machine_feats.mean(0)
 
-                # ── 订单选择 ──
-                h_order = compute_order_heuristics(env, schedulable)
-                cand_order_idx = list(range(len(schedulable)))
+            # ── 订单选择 ──────────────────────────────────────────────────────
+            order_indices, stages = zip(*available)
+            order_indices = list(order_indices)
+            candidate_feats = tensors['order_features'][order_indices]  # [n_cand, feat]
 
-                with torch.no_grad() if not collect else torch.enable_grad():
-                    logits_o, val_o = self.order_net(
-                        of, df, gf,
-                        [s[0] for s in schedulable],
-                        h_order
-                    )
+            h_scores_list = [
+                self.env.get_heuristic_scores_order(i) for i in order_indices
+            ]
+            h_scores = torch.FloatTensor(np.stack(h_scores_list)).to(self.device)
 
-                dist_o = Categorical(logits=logits_o)
-                action_o = dist_o.sample()
-                logp_o   = dist_o.log_prob(action_o)
+            with torch.no_grad():
+                probs = self.order_agent.get_action_probs(
+                    candidate_feats, machine_mean, global_feat, h_scores)
+                value_o = self.order_agent.get_value(
+                    candidate_feats, machine_mean, global_feat)
 
-                chosen_order_idx, chosen_stage = schedulable[action_o.item()]
+            dist = torch.distributions.Categorical(probs)
+            action_o = dist.sample()
+            log_prob_o = dist.log_prob(action_o)
 
-                if collect:
-                    traj_order.append({
-                        'of': of.detach(), 'df': df.detach(), 'gf': gf.detach(),
-                        'cand_indices': [s[0] for s in schedulable],
-                        'h_scores': h_order.detach(),
-                        'action': action_o.detach(),
-                        'log_prob': logp_o.detach(),
-                        'value': val_o.detach(),
-                    })
+            chosen_order_idx = order_indices[action_o.item()]
+            chosen_stage = stages[action_o.item()]
 
-                # ── 设备分配 ──
-                idle_devices = env.get_compatible_idle_devices(chosen_order_idx, chosen_stage)
-                if not idle_devices:
-                    schedulable = env.get_schedulable()
-                    state = env._get_state()
-                    continue
+            # ── 设备分配 ──────────────────────────────────────────────────────
+            avail_machines = self.env._get_available_machines(chosen_order_idx, chosen_stage)
+            order_feat = tensors['order_features'][chosen_order_idx]
 
-                h_machine = compute_machine_heuristics(
-                    env, chosen_order_idx, chosen_stage, idle_devices
-                )
-                dev_cand_idx = [env.device_index[d] for d in idle_devices]
+            # 获取可用设备的特征（从全局设备矩阵中找对应行）
+            machine_idx_map = {m_id: i for i, m_id in enumerate(self.env._machine_list)}
+            m_feats_list = [
+                self.env.machines[m].stage  # 仅用于索引
+                for m in avail_machines
+            ]
+            m_feat_tensors = torch.stack([
+                all_machine_feats[machine_idx_map[m]]
+                for m in avail_machines
+            ])  # [n_avail_m, MACHINE_FEAT_DIM]
 
-                with torch.no_grad() if not collect else torch.enable_grad():
-                    logits_m, val_m = self.machine_net(
-                        of, df, gf, dev_cand_idx, h_machine
-                    )
+            h_m_scores = torch.FloatTensor(
+                self.env.get_heuristic_scores_machine(chosen_order_idx, avail_machines)
+            ).to(self.device)
 
-                dist_m   = Categorical(logits=logits_m)
-                action_m = dist_m.sample()
-                logp_m   = dist_m.log_prob(action_m)
-                chosen_device = idle_devices[action_m.item()]
+            with torch.no_grad():
+                probs_m = self.machine_agent.get_action_probs(
+                    order_feat, m_feat_tensors, global_feat, h_m_scores)
+                value_m = self.machine_agent.get_value(
+                    order_feat, m_feat_tensors, global_feat)
 
-                if collect:
-                    traj_machine.append({
-                        'of': of.detach(), 'df': df.detach(), 'gf': gf.detach(),
-                        'cand_indices': dev_cand_idx,
-                        'h_scores': h_machine.detach(),
-                        'action': action_m.detach(),
-                        'log_prob': logp_m.detach(),
-                        'value': val_m.detach(),
-                    })
+            dist_m = torch.distributions.Categorical(probs_m)
+            action_m = dist_m.sample()
+            log_prob_m = dist_m.log_prob(action_m)
 
-                # ── 执行调度 ──
-                env.dispatch(chosen_order_idx, chosen_stage, chosen_device)
-                state = env._get_state()
-                schedulable = env.get_schedulable()
+            chosen_machine = avail_machines[action_m.item()]
 
-            # 推进时间
-            t = env.advance_time()
-            if t is None:
-                break
-            state = env._get_state()
+            # ── 执行动作 ──────────────────────────────────────────────────────
+            self.env.assign(chosen_order_idx, chosen_machine)
+            total_decisions += 1
 
-        reward, makespan, mto_delay, mts_delay = env.compute_reward()
-        return reward, makespan, mto_delay, mts_delay, traj_order, traj_machine, env
+            # 中间奖励（稀疏，仅终端有值）
+            step_reward = 0.0
+            done = self.env.is_done()
 
-    # ──────────────────────────────────────────────────────────────
-    def _compute_returns(self, trajectory, final_reward):
-        """使用 GAE 计算优势和回报（终端奖励）。"""
-        n = len(trajectory)
-        if n == 0:
-            return [], []
-        
-        # 缩放 reward，把 -4e5 压到 -4.0 量级
-        scaled_reward = final_reward / REWARD_SCALE
-        
-        rewards_list = [0.0] * n
-        rewards_list[-1] = scaled_reward
-        values = [t['value'].item() for t in trajectory]
-    
-        advantages = [0.0] * n
-        gae = 0.0
-        for t in reversed(range(n)):
-            next_val = values[t + 1] if t + 1 < n else 0.0
-            delta = rewards_list[t] + GAMMA * next_val - values[t]
-            gae   = delta + GAMMA * GAE_LAMBDA * gae
-            advantages[t] = gae
-    
-        returns = [adv + val for adv, val in zip(advantages, values)]
-        return advantages, returns
+            # 存入缓冲
+            buffer.add_order(
+                candidate_feats.cpu().numpy(),
+                machine_mean.cpu().numpy(),
+                global_feat.cpu().numpy(),
+                h_scores.cpu().numpy(),
+                action_o.item(), log_prob_o.item(),
+                value_o.item(), step_reward, float(done)
+            )
+            buffer.add_machine(
+                order_feat.cpu().numpy(),
+                m_feat_tensors.cpu().numpy(),
+                global_feat.cpu().numpy(),
+                h_m_scores.cpu().numpy(),
+                action_m.item(), log_prob_m.item(),
+                value_m.item(), step_reward, float(done)
+            )
 
-    # ──────────────────────────────────────────────────────────────
-    def _ppo_update(self, net, optimizer, trajectory, advantages, returns, is_order, entropy_coef=ENTROPY_COEF):
-        """PPO 更新（全局归一化优势，批量前向加速）。"""
-        if not trajectory:
-            return 0.0, 0.0
+            state = self.env._get_state()
 
-        n = len(trajectory)
-        indices = np.arange(n)
+            # 如果没有更多可调度订单，推进时间
+            if not self.env._get_available_orders() and not self.env.is_done():
+                self.env.step_to_next_event()
+                state = self.env._get_state()
 
-        adv_arr  = np.array(advantages, dtype=np.float32)
-        ret_arr  = np.array(returns,    dtype=np.float32)
-        adv_norm = (adv_arr - adv_arr.mean()) / (adv_arr.std() + 1e-8)
-        ret_norm = (ret_arr - ret_arr.mean()) / (ret_arr.std() + 1e-8)
+        # 终端奖励
+        terminal_reward = self.env.compute_reward()
+        if buffer.order_transitions:
+            buffer.order_transitions[-1]['reward'] = terminal_reward
+            buffer.order_transitions[-1]['done'] = 1.0
+        if buffer.machine_transitions:
+            buffer.machine_transitions[-1]['reward'] = terminal_reward
+            buffer.machine_transitions[-1]['done'] = 1.0
 
-        total_loss = 0.0
-        total_entr = 0.0
-        n_updates  = 0
+        metrics = self.env.get_metrics()
+        return buffer, metrics
 
-        for _ in range(PPO_EPOCHS):
-            np.random.shuffle(indices)
-            for start in range(0, n, MINI_BATCH):
-                batch_idx = indices[start:start + MINI_BATCH]
-                pg_losses, vf_losses, entropies = [], [], []
+    # ─── PPO 更新 ─────────────────────────────────────────────────────────────
+    def _ppo_update_agent(self, agent, optimizer, transitions,
+                          feat_key_list, action_key, is_order_agent):
+        """通用 PPO 更新函数"""
+        if not transitions:
+            return 0.0, 0.0, 0.0
+
+        rewards = np.array([t['reward'] for t in transitions])
+        values = np.array([t['value'] for t in transitions])
+        dones = np.array([t['done'] for t in transitions])
+        advantages, returns = compute_gae(
+            rewards, values, dones, self.config.gamma, self.config.gae_lambda)
+
+        # 标准化优势
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        n_updates = 0
+
+        for _ in range(self.config.n_epochs):
+            # 小批量随机更新
+            indices = np.random.permutation(len(transitions))
+            for start in range(0, len(indices), self.config.batch_size):
+                batch_idx = indices[start: start + self.config.batch_size]
 
                 for bi in batch_idx:
-                    t   = trajectory[bi]
-                    adv = torch.tensor(float(adv_norm[bi]), dtype=torch.float32, device=DEVICE)
-                    ret = torch.tensor(float(ret_norm[bi]), dtype=torch.float32, device=DEVICE)
+                    t = transitions[bi]
+                    adv = torch.FloatTensor([advantages[bi]]).to(self.device)
+                    ret = torch.FloatTensor([returns[bi]]).to(self.device)
+                    old_log_prob = torch.FloatTensor([t['log_prob']]).to(self.device)
+                    action = t[action_key]
 
-                    logits, value = net(t['of'], t['df'], t['gf'],
-                                       t['cand_indices'], t['h_scores'])
-                    dist    = Categorical(logits=logits)
-                    new_lp  = dist.log_prob(t['action'])
+                    global_feat = torch.FloatTensor(t['global_feat']).to(self.device)
+                    h_scores = torch.FloatTensor(t['heuristic_scores']).to(self.device)
+
+                    if is_order_agent:
+                        order_feats = torch.FloatTensor(t['order_feats']).to(self.device)
+                        machine_mean = torch.FloatTensor(t['machine_mean']).to(self.device)
+                        probs = agent.get_action_probs(order_feats, machine_mean, global_feat, h_scores)
+                        value = agent.get_value(order_feats, machine_mean, global_feat)
+                    else:
+                        order_feat = torch.FloatTensor(t['order_feat']).to(self.device)
+                        machine_feats = torch.FloatTensor(t['machine_feats']).to(self.device)
+                        probs = agent.get_action_probs(order_feat, machine_feats, global_feat, h_scores)
+                        value = agent.get_value(order_feat, machine_feats, global_feat)
+
+                    dist = torch.distributions.Categorical(probs)
+                    new_log_prob = dist.log_prob(torch.tensor(action).to(self.device))
                     entropy = dist.entropy()
 
-                    ratio  = torch.exp(new_lp - t['log_prob'])
-                    surr1  = ratio * adv
-                    surr2  = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
-                    pg_losses.append(-torch.min(surr1, surr2))
-                    vf_losses.append(F.mse_loss(value, ret))
-                    entropies.append(entropy)
+                    ratio = torch.exp(new_log_prob - old_log_prob)
+                    surr1 = ratio * adv
+                    surr2 = torch.clamp(ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps) * adv
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    value_loss = F.mse_loss(value.unsqueeze(0), ret)
 
-                pg_loss = torch.stack(pg_losses).mean()
-                vf_loss = torch.stack(vf_losses).mean()
-                ent     = torch.stack(entropies).mean()
-                loss    = pg_loss + VF_COEF * vf_loss - entropy_coef * ent
+                    loss = (policy_loss
+                            + self.config.value_coef * value_loss
+                            - self.config.entropy_coef * entropy)
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(net.parameters(), MAX_GRAD_NORM)
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), self.config.max_grad_norm)
+                    optimizer.step()
 
-                total_loss += loss.item()
-                total_entr += ent.item()
-                n_updates  += 1
+                    total_policy_loss += policy_loss.item()
+                    total_value_loss += value_loss.item()
+                    total_entropy += entropy.item()
+                    n_updates += 1
 
-        return total_loss / max(n_updates, 1), total_entr / max(n_updates, 1)
+        if n_updates == 0:
+            return 0.0, 0.0, 0.0
+        return (total_policy_loss / n_updates,
+                total_value_loss / n_updates,
+                total_entropy / n_updates)
 
-    # ──────────────────────────────────────────────────────────────
-    def train(self, n_episodes=300, log_interval=10):
-        print(f"训练开始，共 {n_episodes} 个 episode，使用设备: {DEVICE}")
-        best_reward = -float('inf')
-        best_env    = None
+    # ─── 训练主循环 ───────────────────────────────────────────────────────────
+    def train(self, n_iterations=100, log_interval=10):
+        """
+        主训练循环
+        n_iterations: 更新迭代次数
+        log_interval: 每隔多少次打印日志
+        """
+        print(f"\n{'='*60}")
+        print(f"开始训练 | 迭代次数: {n_iterations} | 设备: {self.device}")
+        print(f"{'='*60}\n")
 
-        buf_traj_o, buf_traj_m = [], []
-        buf_adv_o,  buf_adv_m  = [], []
-        buf_ret_o,  buf_ret_m  = [], []
+        for iteration in range(1, n_iterations + 1):
+            # 采集多个 episode
+            all_order_trans = []
+            all_machine_trans = []
+            episode_rewards = []
+            episode_makespans = []
+            episode_delays = []
 
-        ENTROPY_START = 0.1   # 起始熵系数
-        ENTROPY_END   = 0.005  # 终态熵系数
+            for _ in range(self.config.n_episodes_per_update):
+                buffer, metrics = self.collect_episode()
+                all_order_trans.extend(buffer.order_transitions)
+                all_machine_trans.extend(buffer.machine_transitions)
+                episode_rewards.append(self.env.compute_reward())
+                episode_makespans.append(metrics['makespan_min'])
+                episode_delays.append(metrics['total_delay'] / 60.0)
 
-        for ep in range(1, n_episodes + 1):
-            # 线性退火熵系数
-            alpha = ep / n_episodes
-            current_entropy_coef = ENTROPY_START * (1 - alpha) + ENTROPY_END * alpha
-            reward, makespan, mto_d, mts_d, traj_o, traj_m, env = self._run_episode()
+            # PPO 更新
+            o_ploss, o_vloss, o_ent = self._ppo_update_agent(
+                self.order_agent, self.order_optimizer,
+                all_order_trans, None, 'action_idx', is_order_agent=True)
+            m_ploss, m_vloss, m_ent = self._ppo_update_agent(
+                self.machine_agent, self.machine_optimizer,
+                all_machine_trans, None, 'action_idx', is_order_agent=False)
 
-            adv_o, ret_o = self._compute_returns(traj_o, reward)
-            adv_m, ret_m = self._compute_returns(traj_m, reward)
+            # 记录
+            avg_reward = np.mean(episode_rewards)
+            avg_makespan = np.mean(episode_makespans)
+            avg_delay = np.mean(episode_delays)
+            total_loss = o_ploss + o_vloss + m_ploss + m_vloss
+            avg_entropy = (o_ent + m_ent) / 2
 
-            buf_traj_o.extend(traj_o); buf_adv_o.extend(adv_o); buf_ret_o.extend(ret_o)
-            buf_traj_m.extend(traj_m); buf_adv_m.extend(adv_m); buf_ret_m.extend(ret_m)
+            self.history['reward'].append(avg_reward)
+            self.history['makespan'].append(avg_makespan)
+            self.history['total_delay'].append(avg_delay)
+            self.history['loss'].append(total_loss)
+            self.history['entropy'].append(avg_entropy)
+            self.history['makespans_raw'].append(episode_makespans)
+            self.history['delays_raw'].append(episode_delays)
 
-            loss_o = loss_m = entr_o = entr_m = 0.0
-            if ep % COLLECT_INTERVAL == 0:
-                loss_o, entr_o = self._ppo_update(
-                    self.order_net,   self.opt_order,   buf_traj_o, buf_adv_o, buf_ret_o, True)
-                loss_m, entr_m = self._ppo_update(
-                    self.machine_net, self.opt_machine, buf_traj_m, buf_adv_m, buf_ret_m, False)
-                buf_traj_o.clear(); buf_adv_o.clear(); buf_ret_o.clear()
-                buf_traj_m.clear(); buf_adv_m.clear(); buf_ret_m.clear()
+            if iteration % log_interval == 0 or iteration == 1:
+                print(f"Iter {iteration:4d}/{n_iterations} | "
+                      f"奖励: {avg_reward:8.4f} | "
+                      f"完工时间: {avg_makespan:8.1f}min | "
+                      f"拖期: {avg_delay:8.1f}min | "
+                      f"Loss: {total_loss:.4f} | "
+                      f"Entropy: {avg_entropy:.4f}")
 
-            self.history['reward'].append(reward)
-            self.history['makespan'].append(makespan / 60)
-            self.history['mto_delay'].append(mto_d / 60)
-            self.history['mts_delay'].append(mts_d / 60)
-            self.history['loss_order'].append(loss_o)
-            self.history['loss_machine'].append(loss_m)
-            self.history['entropy_order'].append(entr_o)
-            self.history['entropy_machine'].append(entr_m)
+        print(f"\n训练完成！共 {n_iterations} 次迭代")
+        return self.history
 
-            if reward > best_reward:
-                best_reward = reward
-                best_env    = env
+    def save_models(self, path_order='order_agent.pth', path_machine='machine_agent.pth'):
+        torch.save(self.order_agent.state_dict(), path_order)
+        torch.save(self.machine_agent.state_dict(), path_machine)
+        print(f"模型已保存: {path_order}, {path_machine}")
 
-            if ep % log_interval == 0:
-                avg_r  = np.mean(self.history['reward'][-log_interval:])
-                avg_mk = np.mean(self.history['makespan'][-log_interval:])
-                avg_lo = np.mean([v for v in self.history['loss_order'][-log_interval:] if v != 0])  or 0
-                avg_eo = np.mean([v for v in self.history['entropy_order'][-log_interval:] if v != 0]) or 0
-                print(f"Ep {ep:4d} | Reward={avg_r:10.1f} | Makespan={avg_mk:.1f}min | "
-                      f"MTO_delay={np.mean(self.history['mto_delay'][-log_interval:]):.1f}min | "
-                      f"Loss={avg_lo:.4f} | Entr={avg_eo:.3f}")
+    def load_models(self, path_order='order_agent.pth', path_machine='machine_agent.pth'):
+        self.order_agent.load_state_dict(torch.load(path_order, map_location=self.device))
+        self.machine_agent.load_state_dict(torch.load(path_machine, map_location=self.device))
+        print("模型已加载")
 
-        print(f"\n训练完成！最佳奖励={best_reward:.1f}")
-        return best_env
+    def run_inference(self):
+        """运行一次推理，返回完整调度结果（贪心策略）"""
+        state = self.env.reset()
+        self.order_agent.eval()
+        self.machine_agent.eval()
 
-    # ──────────────────────────────────────────────────────────────
-    def evaluate(self, n_runs=20):
-        """评估阶段：运行多次，收集指标用于箱线图。"""
-        results = []
-        for _ in range(n_runs):
-            reward, makespan, mto_d, mts_d, _, _, env = self._run_episode(collect=False)
-            results.append({
-                'reward': reward,
-                'makespan': makespan / 60,
-                'mto_delay': mto_d / 60,
-                'mts_delay': mts_d / 60,
-                'env': env
-            })
-        return results
+        with torch.no_grad():
+            for _ in range(10000):
+                if self.env.is_done():
+                    break
+                available = self.env._get_available_orders()
+                if not available:
+                    self.env.step_to_next_event()
+                    state = self.env._get_state()
+                    continue
+
+                tensors = state_to_tensors(state, self.device)
+                global_feat = tensors['global_features']
+                all_machine_feats = tensors['machine_features']
+                machine_mean = all_machine_feats.mean(0)
+
+                order_indices, stages = zip(*available)
+                order_indices = list(order_indices)
+                candidate_feats = tensors['order_features'][order_indices]
+                h_scores = torch.FloatTensor(np.stack([
+                    self.env.get_heuristic_scores_order(i) for i in order_indices
+                ])).to(self.device)
+
+                probs = self.order_agent.get_action_probs(
+                    candidate_feats, machine_mean, global_feat, h_scores)
+                action_o = probs.argmax().item()  # 贪心
+
+                chosen_order_idx = order_indices[action_o]
+                chosen_stage = stages[action_o]
+
+                avail_machines = self.env._get_available_machines(chosen_order_idx, chosen_stage)
+                order_feat = tensors['order_features'][chosen_order_idx]
+                machine_idx_map = {m_id: i for i, m_id in enumerate(self.env._machine_list)}
+                m_feat_tensors = torch.stack([
+                    all_machine_feats[machine_idx_map[m]] for m in avail_machines
+                ])
+                h_m = torch.FloatTensor(
+                    self.env.get_heuristic_scores_machine(chosen_order_idx, avail_machines)
+                ).to(self.device)
+
+                probs_m = self.machine_agent.get_action_probs(
+                    order_feat, m_feat_tensors, global_feat, h_m)
+                action_m = probs_m.argmax().item()
+                chosen_machine = avail_machines[action_m]
+
+                self.env.assign(chosen_order_idx, chosen_machine)
+                state = self.env._get_state()
+
+                if not self.env._get_available_orders() and not self.env.is_done():
+                    self.env.step_to_next_event()
+                    state = self.env._get_state()
+
+        self.order_agent.train()
+        self.machine_agent.train()
+        return self.env.schedule_history, self.env.get_metrics()
+
+
+if __name__ == '__main__':
+    import sys
+    sys.path.insert(0, '/home/claude/workshop_scheduling')
+    from data_loader import load_all_data
+
+    data = load_all_data('/mnt/user-data/uploads/data.xlsx')
+    trainer = PPOTrainer(data)
+
+    # 测试单个 episode 采样
+    print("测试 episode 采样...")
+    buffer, metrics = trainer.collect_episode()
+    print(f"  订单决策步数: {len(buffer.order_transitions)}")
+    print(f"  设备决策步数: {len(buffer.machine_transitions)}")
+    print(f"  完工时间: {metrics['makespan_min']:.1f} 分钟")
+    print(f"  拖期总和: {metrics['total_delay']/60:.1f} 分钟")
+    print("PPO 训练模块测试成功 ✓")
