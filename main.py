@@ -38,7 +38,7 @@ def main():
 
     # ── 训练 ──────────────────────────────────────────────────────
     trainer = PPOTrainer(data)
-    best_env = trainer.train(n_episodes=args.episodes, log_interval=20)
+    best_env = trainer.train(n_episodes=args.episodes, log_interval=100)
 
     # ── 评估 ──────────────────────────────────────────────────────
     print(f"\n开始评估 ({args.eval} 次)...")
