@@ -24,8 +24,8 @@ ENTROPY_COEF = 0.005
 VF_COEF      = 0.5
 MAX_GRAD_NORM= 0.5
 PPO_EPOCHS   = 2
-MINI_BATCH   = 128
-COLLECT_INTERVAL = 8   # 每收集4个episode的轨迹后做一次PPO更新
+MINI_BATCH   = 512
+COLLECT_INTERVAL = 16   # 每收集16个episode的轨迹后做一次PPO更新
 
 
 class PPOTrainer:
