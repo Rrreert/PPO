@@ -22,10 +22,10 @@ from models import (
 
 DEVICE        = 'cpu'
 LR            = 3e-4
-GAMMA         = 0.99
-LAM           = 0.95
-CLIP_EPS      = 0.2
-ENTROPY_COEF  = 0.02
+GAMMA         = 0.95
+LAM           = 0.90
+CLIP_EPS      = 0.15
+ENTROPY_COEF  = 0.05
 VALUE_COEF    = 0.5
 MAX_GRAD_NORM = 0.5
 N_EPOCHS      = 4
@@ -224,6 +224,7 @@ def run_episode(env, order_policy, order_value,
         # ---- 执行动作 ----
         obs, _, _ = env.step(sel_os, sel_op, chosen_m)
 
+        shaping = 0.01
         if training:
             # 存储 numpy（不转 tensor，batch 时统一处理）
             buffer.o_ctx_np.append(ctx_o[0].numpy())    # [N, 40]
@@ -240,7 +241,7 @@ def run_episode(env, order_policy, order_value,
             buffer.m_values.append(val_m)
             buffer.m_flat_np.append(fs)
 
-            buffer.rewards.append(0.0)
+            buffer.rewards.append(shaping)
             buffer.dones.append(False)
 
         steps += 1
@@ -339,6 +340,10 @@ def train(n_episodes=N_EPISODES,
             print(f"{ep:>5} | {reward:>10.1f} | {metrics['makespan']:>9.1f} | "
                   f"{metrics['mto_tardiness']:>8.1f} | {metrics['mts_tardiness']:>8.1f} | "
                   f"{pl_o+vl_o:>8.4f} | {pl_m+vl_m:>8.4f} | {elapsed:>5.2f}")
+
+        if ep % 200 == 0:
+            for g in opt_o.param_groups: g['lr'] *= 0.9
+            for g in opt_m.param_groups: g['lr'] *= 0.9
             
     torch.save({
         "order_policy":   order_policy.state_dict(),
