@@ -29,7 +29,7 @@ ENTROPY_COEF  = 0.02
 VALUE_COEF    = 0.5
 MAX_GRAD_NORM = 0.5
 N_EPOCHS      = 4
-N_EPISODES    = 300
+N_EPISODES    = 2000
 FLAT_DIM = N_ORDERS*ORDER_FEAT_DIM + N_MACHINES*MACHINE_FEAT_DIM + GLOBAL_FEAT_DIM
 REWARD_SCALE  = 1000.0   # 奖励缩放，使数值在 -10 量级
 
@@ -339,6 +339,15 @@ def train(n_episodes=N_EPISODES,
             print(f"{ep:>5} | {reward:>10.1f} | {metrics['makespan']:>9.1f} | "
                   f"{metrics['mto_tardiness']:>8.1f} | {metrics['mts_tardiness']:>8.1f} | "
                   f"{pl_o+vl_o:>8.4f} | {pl_m+vl_m:>8.4f} | {elapsed:>5.2f}")
+            
+        # 学习率衰减：每100轮衰减5%
+        if ep % 100 == 0:
+            for g in opt_o.param_groups:
+                g['lr'] *= 0.95
+            for g in opt_m.param_groups:
+                g['lr'] *= 0.95
+            cur_lr = opt_o.param_groups[0]['lr']
+            print(f"  → LR decayed to {cur_lr:.2e}")
 
     torch.save({
         "order_policy":   order_policy.state_dict(),
