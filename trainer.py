@@ -343,10 +343,6 @@ def train(n_episodes=N_EPISODES,
                   f"{metrics['mto_tardiness']:>8.1f} | {metrics['mts_tardiness']:>8.1f} | "
                   f"{pl_o+vl_o:>8.4f} | {pl_m+vl_m:>8.4f} | {elapsed:>5.2f}")
 
-        if ep % 200 == 0:
-            for g in opt_o.param_groups: g['lr'] *= 0.9
-            for g in opt_m.param_groups: g['lr'] *= 0.9
-            
     torch.save({
         "order_policy":   order_policy.state_dict(),
         "order_value":    order_value.state_dict(),
