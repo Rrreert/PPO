@@ -281,7 +281,7 @@ class WorkshopEnv:
                 oh[st] = 1.0
                 op_st.extend(oh)
             # 当前时刻距交货时间（归一化）
-            time_to_due = max(0, os.due_time - self.current_time / 60) / (4320)
+            time_to_due = max(0, os.due_time / 60 - self.current_time / 60) / (4320)
             order_feats.append([pt_idx, qty_norm, mode_val, due_norm, time_to_due] + op_st)
 
         # 机器特征
@@ -330,7 +330,7 @@ class WorkshopEnv:
             type_score = 0.5 if os.mode == 'MTO' else 0.3
             # 规则二：交货紧迫度
             min_rem = MIN_REMAINING[os.id][op]  # 秒
-            delta_t = os.due_time - (self.current_time / 60) - (min_rem / 60)  # 分钟
+            delta_t = os.due_time / 60 - (self.current_time / 60) - (min_rem / 60)  # 分钟
             if delta_t <= 0:
                 delay_score = 1.0
             elif delta_t <= 1440:
