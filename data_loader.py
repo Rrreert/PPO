@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from openpyxl import load_workbook
 
-EXCEL_PATH = "/mnt/user-data/uploads/ppo_data.xlsx"
+EXCEL_PATH = "/kaggle/working/PPO/data.xlsx"
 
 # 产品型号列表（字符串）
 PRODUCT_TYPES = [f"{i:02d}" for i in range(1, 16)]   # '01'~'15'
