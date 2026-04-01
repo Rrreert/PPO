@@ -163,7 +163,7 @@ def ppo_update_batched(policy_net, value_net, optimizer,
 
 def run_episode(env, order_policy, order_value,
                 machine_policy, machine_value,
-                buffer, training=True):
+                buffer, ep=1, n_episodes=1000, training=True):
     """
     执行一个完整 episode，收集轨迹并返回终端奖励（未缩放）
     """
@@ -296,7 +296,7 @@ def train(n_episodes=N_EPISODES,
         buf.clear()
         t0     = time.time()
         reward = run_episode(env, order_policy, order_value,
-                             machine_policy, machine_value, buf, training=True)
+                             machine_policy, machine_value, buf, ep=ep, n_episodes=n_episodes, training=True)
         metrics = env.get_metrics()
         T       = len(buf)
 
