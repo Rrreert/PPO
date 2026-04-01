@@ -22,10 +22,10 @@ from models import (
 
 DEVICE        = 'cpu'
 LR            = 3e-4
-GAMMA         = 0.95
-LAM           = 0.90
-CLIP_EPS      = 0.15
-ENTROPY_COEF  = 0.05
+GAMMA         = 0.99
+LAM           = 0.95
+CLIP_EPS      = 0.2
+ENTROPY_COEF  = 0.02
 VALUE_COEF    = 0.5
 MAX_GRAD_NORM = 0.5
 N_EPOCHS      = 4
@@ -163,7 +163,7 @@ def ppo_update_batched(policy_net, value_net, optimizer,
 
 def run_episode(env, order_policy, order_value,
                 machine_policy, machine_value,
-                buffer, training=True):
+                buffer, ep, n_episodes, training=True):
     """
     执行一个完整 episode，收集轨迹并返回终端奖励（未缩放）
     """
@@ -196,8 +196,11 @@ def run_episode(env, order_policy, order_value,
         probs_o = lp_o[0].exp().cpu().numpy()
         probs_o = np.nan_to_num(probs_o, nan=1.0/len(schedulable))
         probs_o = np.clip(probs_o, 1e-10, None); probs_o /= probs_o.sum()
-        cand_idx = (np.random.choice(len(schedulable), p=probs_o)
-                    if training else int(np.argmax(probs_o)))
+        epsilon = max(0.05, 0.3 * (1 - ep / n_episodes))  # 需要把 ep 传入函数
+        if training and random.random() < epsilon:
+            cand_idx = random.randint(0, len(schedulable) - 1)  # 随机探索
+        else:
+            cand_idx = int(np.argmax(probs_o))  # 贪心
 
         sel_os, sel_op = schedulable[cand_idx]
         old_lp_o       = lp_o[0, cand_idx].item()
@@ -221,10 +224,23 @@ def run_episode(env, order_policy, order_value,
         chosen_m = free_m[mach_idx]
         old_lp_m = lp_m[0, mach_idx].item()
 
+        tard_before = sum(
+            max(0, os.due_time - (env.current_time / 60))
+            for os in env.order_states
+            if os.op_status['G'] != 3   # 未完成的订单
+        )
+
         # ---- 执行动作 ----
         obs, _, _ = env.step(sel_os, sel_op, chosen_m)
 
-        shaping = 0.01
+        # 执行动作之后，计算拖期改善量作为塑形奖励
+        tard_after = sum(
+            max(0, os.due_time - (env.current_time / 60))
+            for os in env.order_states
+            if os.op_status['G'] != 3
+        )
+        shaping = (tard_before - tard_after) / 1000.0  # 缩放到合理量级
+
         if training:
             # 存储 numpy（不转 tensor，batch 时统一处理）
             buffer.o_ctx_np.append(ctx_o[0].numpy())    # [N, 40]
@@ -294,7 +310,7 @@ def train(n_episodes=N_EPISODES,
         buf.clear()
         t0     = time.time()
         reward = run_episode(env, order_policy, order_value,
-                             machine_policy, machine_value, buf, training=True)
+                             machine_policy, machine_value, buf, ep=ep, n_episodes=n_episodes, training=True)
         metrics = env.get_metrics()
         T       = len(buf)
 
