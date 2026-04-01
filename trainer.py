@@ -340,15 +340,6 @@ def train(n_episodes=N_EPISODES,
                   f"{metrics['mto_tardiness']:>8.1f} | {metrics['mts_tardiness']:>8.1f} | "
                   f"{pl_o+vl_o:>8.4f} | {pl_m+vl_m:>8.4f} | {elapsed:>5.2f}")
             
-        # 学习率衰减：每100轮衰减5%
-        if ep % 100 == 0:
-            for g in opt_o.param_groups:
-                g['lr'] *= 0.95
-            for g in opt_m.param_groups:
-                g['lr'] *= 0.95
-            cur_lr = opt_o.param_groups[0]['lr']
-            print(f"  → LR decayed to {cur_lr:.2e}")
-
     torch.save({
         "order_policy":   order_policy.state_dict(),
         "order_value":    order_value.state_dict(),
