@@ -224,22 +224,8 @@ def run_episode(env, order_policy, order_value,
         chosen_m = free_m[mach_idx]
         old_lp_m = lp_m[0, mach_idx].item()
 
-        tard_before = sum(
-            max(0, os.due_time - (env.current_time / 60))
-            for os in env.order_states
-            if os.op_status['G'] != 3   # 未完成的订单
-        )
-
         # ---- 执行动作 ----
         obs, _, _ = env.step(sel_os, sel_op, chosen_m)
-
-        # 执行动作之后，计算拖期改善量作为塑形奖励
-        tard_after = sum(
-            max(0, os.due_time - (env.current_time / 60))
-            for os in env.order_states
-            if os.op_status['G'] != 3
-        )
-        shaping = (tard_before - tard_after) / 1000.0  # 缩放到合理量级
 
         if training:
             # 存储 numpy（不转 tensor，batch 时统一处理）
@@ -257,7 +243,7 @@ def run_episode(env, order_policy, order_value,
             buffer.m_values.append(val_m)
             buffer.m_flat_np.append(fs)
 
-            buffer.rewards.append(shaping)
+            buffer.rewards.append(0.0)
             buffer.dones.append(False)
 
         steps += 1
