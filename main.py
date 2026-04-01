@@ -2,9 +2,9 @@
 主入口：训练 PPO 并生成全部输出
 """
 import os, sys
-sys.path.insert(0, '/home/claude/workshop_scheduling')
+sys.path.insert(0, '/kaggle/working/PPO')
 
-OUTPUT_DIR = '/mnt/user-data/outputs/workshop_scheduling'
+OUTPUT_DIR = '/kaggle/working/PPO/outputs'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 from trainer import train, run_episode, RolloutBuffer, N_EPISODES

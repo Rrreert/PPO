@@ -263,7 +263,7 @@ def run_episode(env, order_policy, order_value,
 
 
 def train(n_episodes=N_EPISODES,
-          save_path="/home/claude/workshop_scheduling/checkpoints"):
+          save_path="/kaggle/working/PPO/checkpoints"):
     import os, time
     os.makedirs(save_path, exist_ok=True)
 
