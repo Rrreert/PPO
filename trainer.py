@@ -100,34 +100,6 @@ class RunningMeanStd:
         return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 
-
-    """存储一个 episode 的全部轨迹"""
-    def __init__(self):
-        self.clear()
-
-    def clear(self):
-        # 订单智能体：存储原始 numpy，批量化时再处理
-        self.o_ctx_np   = []   # list of np [n_cand, ORDER_CONTEXT_DIM]
-        self.o_hs_np    = []   # list of np [n_cand, 2]
-        self.o_actions  = []   # int
-        self.o_logprobs = []   # float
-        self.o_values   = []   # float
-        self.o_flat_np  = []   # np [FLAT_DIM]
-        # 设备智能体
-        self.m_ctx_np   = []
-        self.m_hs_np    = []
-        self.m_actions  = []
-        self.m_logprobs = []
-        self.m_values   = []
-        self.m_flat_np  = []
-        # 奖励
-        self.rewards    = []
-        self.dones      = []
-
-    def __len__(self):
-        return len(self.rewards)
-
-
 def compute_gae(rewards, values, dones, last_value=0.0, gamma=GAMMA, lam=LAM):
     """GAE，支持截断 Bootstrap（last_value）。"""
     T   = len(rewards)
