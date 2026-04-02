@@ -335,7 +335,7 @@ def train(n_episodes=N_EPISODES,
         history["entropy_o"].append(ent_o)
         history["entropy_m"].append(ent_m)
 
-        if ep % 10 == 0 or ep == 1:
+        if ep % 50 == 0 or ep == 1:
             print(f"{ep:>5} | {reward:>10.1f} | {metrics['makespan']:>9.1f} | "
                   f"{metrics['mto_tardiness']:>8.1f} | {metrics['mts_tardiness']:>8.1f} | "
                   f"{pl_o+vl_o:>8.4f} | {pl_m+vl_m:>8.4f} | {elapsed:>5.2f}")
