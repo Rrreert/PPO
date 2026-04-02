@@ -8,7 +8,7 @@ OUTPUT_DIR = '/kaggle/working/PPO/outputs'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 from trainer import train, run_episode, RolloutBuffer, N_EPISODES
-from visualize import (
+from visualization import (
     plot_gantt, plot_boxplots, plot_training_curves,
     make_tardiness_table, run_multiple_episodes,
 )
