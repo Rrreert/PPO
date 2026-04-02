@@ -1,64 +1,60 @@
 """
-主程序入口：车间调度 PPO 强化学习
-用法：python main.py [--episodes 300] [--eval 20] [--data data.xlsx]
+主入口：训练 PPO 并生成全部输出
 """
-import argparse
-import os
-import torch
+import os, sys
+sys.path.insert(0, '/kaggle/working/PPO')
 
-from data_loader import load_all_data
-from ppo_trainer import PPOTrainer
-from visualization import (
-    plot_gantt, plot_boxplot, plot_training_curves,
-    export_delay_table, print_summary
+OUTPUT_DIR = '/kaggle/working/PPO/outputs'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+from trainer import train, run_episode, RolloutBuffer, N_EPISODES
+from visualize import (
+    plot_gantt, plot_boxplots, plot_training_curves,
+    make_tardiness_table, run_multiple_episodes,
 )
 
+print("=" * 60)
+print("  车间调度 PPO 训练启动")
+print(f"  训练轮次: {N_EPISODES}")
+print("=" * 60)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='车间调度 PPO')
-    parser.add_argument('--data',     default='/mnt/user-data/uploads/data.xlsx')
-    parser.add_argument('--episodes', type=int, default=300)
-    parser.add_argument('--eval',     type=int, default=20)
-    parser.add_argument('--outdir',   default='output')
-    parser.add_argument('--seed',     type=int, default=42)
-    return parser.parse_args()
+# ---- 训练 ----
+history, env, order_policy, order_value, machine_policy, machine_value = train(
+    n_episodes=N_EPISODES,
+    save_path=OUTPUT_DIR,
+)
 
+print("\n[1/4] 生成甘特图...")
+# 运行一次最终评估 episode（贪心）
+dummy_buf = RolloutBuffer()
+dummy_buf.clear()
+run_episode(env, order_policy, order_value,
+            machine_policy, machine_value, dummy_buf, training=False)
+gantt_data = env.get_gantt_data()
+plot_gantt(gantt_data, save_path=f"{OUTPUT_DIR}/gantt.png")
 
-def main():
-    args = parse_args()
-    torch.manual_seed(args.seed)
+print("\n[2/4] 生成箱线图（评估 30 个 episode）...")
+makespans, mto_tards, mts_tards = run_multiple_episodes(
+    30, env, order_policy, order_value, machine_policy, machine_value
+)
+plot_boxplots(makespans, mto_tards, mts_tards,
+              save_path=f"{OUTPUT_DIR}/boxplot.png")
 
-    os.makedirs(args.outdir, exist_ok=True)
+print("\n[3/4] 生成训练迭代曲线...")
+plot_training_curves(history, save_path=f"{OUTPUT_DIR}/training_curves.png")
 
-    print("加载数据...")
-    data = load_all_data(args.data)
-    print(f"  订单数: {len(data['orders'])}")
-    print(f"  设备数: {len(data['device_compatibility'])}")
-    print(f"  产品型号数: {len(data['product_types'])}")
+print("\n[4/4] 生成拖期时间表...")
+# 用最后一次 episode 结果
+dummy_buf.clear()
+run_episode(env, order_policy, order_value,
+            machine_policy, machine_value, dummy_buf, training=False)
+df_tard = make_tardiness_table(env, save_path=f"{OUTPUT_DIR}/tardiness_table.csv")
 
-    # ── 训练 ──────────────────────────────────────────────────────
-    trainer = PPOTrainer(data)
-    best_env = trainer.train(n_episodes=args.episodes, log_interval=100)
-
-    # ── 评估 ──────────────────────────────────────────────────────
-    print(f"\n开始评估 ({args.eval} 次)...")
-    eval_results = trainer.evaluate(n_runs=args.eval)
-
-    # ── 输出 ──────────────────────────────────────────────────────
-    print_summary(best_env, data)
-
-    gantt_path   = os.path.join(args.outdir, 'gantt.png')
-    box_path     = os.path.join(args.outdir, 'boxplot.png')
-    curve_path   = os.path.join(args.outdir, 'training_curves.png')
-    delay_path   = os.path.join(args.outdir, 'delay_table.csv')
-
-    plot_gantt(best_env, save_path=gantt_path)
-    plot_boxplot(eval_results, save_path=box_path)
-    plot_training_curves(trainer.history, save_path=curve_path)
-    export_delay_table(best_env, data, save_path=delay_path)
-
-    print(f"\n所有输出已保存到 '{args.outdir}/' 目录")
-
-
-if __name__ == '__main__':
-    main()
+print("\n" + "=" * 60)
+print("  所有输出已保存至:", OUTPUT_DIR)
+m = env.get_metrics()
+print(f"  最终 Makespan:      {m['makespan']:.1f} 分钟")
+print(f"  MTO 拖期总和:       {m['mto_tardiness']:.1f} 分钟")
+print(f"  MTS 拖期总和:       {m['mts_tardiness']:.1f} 分钟")
+print(f"  过期订单数:         {len(df_tard)}")
+print("=" * 60)
