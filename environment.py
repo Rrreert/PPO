@@ -409,14 +409,8 @@ class WorkshopEnv:
         tardiness = {
             os.id: os.tardiness() / 60 for os in self.order_states
         }
-        mto_tard = sum(
-            v for os, v in zip(self.order_states, tardiness.values())
-            if os.mode == 'MTO'
-        )
-        mts_tard = sum(
-            v for os, v in zip(self.order_states, tardiness.values())
-            if os.mode == 'MTS'
-        )
+        mto_tard = sum(tardiness[os.id] for os in self.order_states if os.mode == 'MTO')
+        mts_tard = sum(tardiness[os.id] for os in self.order_states if os.mode == 'MTS')
         return {
             'makespan': makespan,
             'tardiness': tardiness,

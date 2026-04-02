@@ -31,7 +31,7 @@ MAX_GRAD_NORM = 0.5
 N_EPOCHS      = 4
 N_EPISODES    = 300
 FLAT_DIM = N_ORDERS*ORDER_FEAT_DIM + N_MACHINES*MACHINE_FEAT_DIM + GLOBAL_FEAT_DIM
-REWARD_SCALE  = 1000.0   # 奖励缩放，使数值在 -10 量级
+REWARD_SCALE  = 100.0    # 修复 Bug3：原 1000 导致初期梯度爆炸，改为 100
 
 
 def flat_state(obs):
@@ -70,15 +70,27 @@ class RolloutBuffer:
         return len(self.rewards)
 
 
-def compute_gae(rewards, values, dones, gamma=GAMMA, lam=LAM):
+def compute_gae(rewards, values, dones, last_value=0.0, gamma=GAMMA, lam=LAM):
+    """
+    修复 Bug2：末尾非 done 步（被截断时）用 last_value Bootstrap，
+    而不是硬编码 0.0，避免 returns 估计偏低。
+    """
     T   = len(rewards)
     adv = np.zeros(T, dtype=np.float32)
     g   = 0.0
     for t in reversed(range(T)):
-        nv    = 0.0 if dones[t] else (values[t+1] if t+1 < T else 0.0)
-        delta = rewards[t] + gamma * nv - values[t]
-        g     = delta + gamma * lam * (0.0 if dones[t] else g)
-        adv[t]= g
+        if dones[t]:
+            # 真正的终止步：下一状态价值为 0，重置 GAE 累积项
+            nv = 0.0
+            g  = 0.0
+        elif t + 1 < T:
+            nv = values[t + 1]
+        else:
+            # 最后一步且未终止（episode 被 step 上限截断）：Bootstrap
+            nv = last_value
+        delta  = rewards[t] + gamma * nv - values[t]
+        g      = delta + gamma * lam * g
+        adv[t] = g
     return adv, adv + np.array(values, dtype=np.float32)
 
 
@@ -166,9 +178,22 @@ def run_episode(env, order_policy, order_value,
                 buffer, training=True):
     """
     执行一个完整 episode，收集轨迹并返回终端奖励（未缩放）
+
+    修复内容
+    --------
+    Bug 1 - 每步记录拖期增量 shaping 奖励，不再全程填 0.0
+    Bug 2 - 截断时在 buffer 上记录 _truncated/_last_flat，
+            供 train() 调用 compute_gae 时传入正确的 last_value
+    Bug 3 - REWARD_SCALE 已改为 100，此处无需额外改动
     """
     obs   = env.reset()
     steps = 0
+    truncated = False
+
+    # 记录上一步的拖期总量（分钟），用于计算增量 shaping 奖励
+    prev_tard_min = sum(
+        os.tardiness(env.current_time) for os in env.order_states
+    ) / 60.0
 
     while True:
         # 推进时间直到有可调度订单
@@ -222,9 +247,17 @@ def run_episode(env, order_policy, order_value,
         old_lp_m = lp_m[0, mach_idx].item()
 
         # ---- 执行动作 ----
-        obs, _, _ = env.step(sel_os, sel_op, chosen_m)
+        obs, _, done = env.step(sel_os, sel_op, chosen_m)
 
         if training:
+            # ---- Bug1 修复：计算 shaping 奖励（拖期增量惩罚）----
+            curr_tard_min = sum(
+                os.tardiness(env.current_time) for os in env.order_states
+            ) / 60.0
+            tard_delta    = curr_tard_min - prev_tard_min   # ≥0 表示拖期在恶化
+            shaping_r     = -tard_delta * 0.01              # 系数可按效果调整
+            prev_tard_min = curr_tard_min
+
             # 存储 numpy（不转 tensor，batch 时统一处理）
             buffer.o_ctx_np.append(ctx_o[0].numpy())    # [N, 40]
             buffer.o_hs_np.append(h_o_t[0].numpy())     # [N, 2]
@@ -240,11 +273,16 @@ def run_episode(env, order_policy, order_value,
             buffer.m_values.append(val_m)
             buffer.m_flat_np.append(fs)
 
-            buffer.rewards.append(0.0)
+            buffer.rewards.append(shaping_r)   # ← Bug1 修复：不再填 0.0
             buffer.dones.append(False)
 
         steps += 1
+
+        if done:
+            break
+
         if steps > 5000:
+            truncated = True
             break
 
     # 清空剩余事件队列
@@ -252,12 +290,17 @@ def run_episode(env, order_policy, order_value,
         env.advance_to_next_event()
 
     # 计算终端奖励
-    terminal_reward        = env._terminal_reward()
-    scaled_reward          = terminal_reward / REWARD_SCALE
+    terminal_reward = env._terminal_reward()
+    scaled_reward   = terminal_reward / REWARD_SCALE
 
     if training and buffer.rewards:
-        buffer.rewards[-1] = scaled_reward
-        buffer.dones[-1]   = True
+        # 最后一步叠加终端奖励（shaping + terminal 合并）
+        buffer.rewards[-1] += scaled_reward
+        buffer.dones[-1]    = True
+
+    # Bug2 修复：把截断信息挂到 buffer，供 train() 里 Bootstrap
+    buffer._truncated  = truncated
+    buffer._last_flat  = flat_state(env._get_obs()) if truncated else None
 
     return terminal_reward   # 返回原始值用于日志
 
@@ -298,11 +341,21 @@ def train(n_episodes=N_EPISODES,
         T       = len(buf)
 
         if T > 0:
-            scaled_r = buf.rewards.copy()  # already scaled, last one is non-zero
+            scaled_r = buf.rewards.copy()  # shaping + terminal 已合并
             full_d   = buf.dones.copy()
 
-            adv_o, ret_o = compute_gae(scaled_r, buf.o_values, full_d)
-            adv_m, ret_m = compute_gae(scaled_r, buf.m_values, full_d)
+            # Bug2 修复：被截断时 Bootstrap last_value
+            if getattr(buf, '_truncated', False) and buf._last_flat is not None:
+                last_fs_t = torch.FloatTensor(buf._last_flat).unsqueeze(0)
+                with torch.no_grad():
+                    last_val_o = order_value(last_fs_t).item()
+                    last_val_m = machine_value(last_fs_t).item()
+            else:
+                last_val_o = 0.0
+                last_val_m = 0.0
+
+            adv_o, ret_o = compute_gae(scaled_r, buf.o_values, full_d, last_value=last_val_o)
+            adv_m, ret_m = compute_gae(scaled_r, buf.m_values, full_d, last_value=last_val_m)
             adv_o = (adv_o - adv_o.mean()) / (adv_o.std() + 1e-8)
             adv_m = (adv_m - adv_m.mean()) / (adv_m.std() + 1e-8)
 
