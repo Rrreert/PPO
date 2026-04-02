@@ -25,15 +25,15 @@ LR            = 3e-4
 GAMMA         = 0.99
 LAM           = 0.95
 CLIP_EPS      = 0.2
-ENTROPY_COEF  = 0.02
-VALUE_COEF    = 0.5
+ENTROPY_COEF  = 0.05   # 提高熵系数，防止大动作空间下策略过早收敛到次优解
+VALUE_COEF    = 0.25   # 降低 value loss 权重，policy loss 主导更新方向
 MAX_GRAD_NORM = 0.5
 N_EPOCHS      = 4
 N_EPISODES    = 300
-N_COLLECT     = 4       # 每次 PPO 更新前收集的 episode 数，降低梯度方差
+N_COLLECT     = 4      # 每次 PPO 更新前收集的 episode 数，降低梯度方差
 FLAT_DIM = N_ORDERS*ORDER_FEAT_DIM + N_MACHINES*MACHINE_FEAT_DIM + GLOBAL_FEAT_DIM
-REWARD_SCALE  = 100.0   # 终端奖励缩放（-7000 -> -70 量级）
-SHAPING_SCALE = 1000.0  # predictive tardiness shaping 归一化基准（分钟）
+REWARD_SCALE  = 100.0  # 终端奖励缩放（-7000 -> -70 量级）
+SHAPING_SCALE = 1000.0 # predictive tardiness shaping 归一化基准（分钟）
 
 
 def flat_state(obs):
@@ -45,6 +45,62 @@ def flat_state(obs):
 
 
 class RolloutBuffer:
+    """存储一个 episode 的全部轨迹"""
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        # 订单智能体：存储原始 numpy，批量化时再处理
+        self.o_ctx_np   = []   # list of np [n_cand, ORDER_CONTEXT_DIM]
+        self.o_hs_np    = []   # list of np [n_cand, 2]
+        self.o_actions  = []   # int
+        self.o_logprobs = []   # float
+        self.o_values   = []   # float
+        self.o_flat_np  = []   # np [FLAT_DIM]
+        # 设备智能体
+        self.m_ctx_np   = []
+        self.m_hs_np    = []
+        self.m_actions  = []
+        self.m_logprobs = []
+        self.m_values   = []
+        self.m_flat_np  = []
+        # 奖励
+        self.rewards    = []
+        self.dones      = []
+
+    def __len__(self):
+        return len(self.rewards)
+
+
+class RunningMeanStd:
+    """
+    Welford 在线算法维护 reward 序列的滑动均值和方差。
+    用于归一化 rewards，保持 returns 与 v_pred 的尺度一致，
+    避免 returns 归一化（破坏 value 学习目标）和不归一化（value loss 爆炸）的两难。
+    """
+    def __init__(self, epsilon=1e-4):
+        self.mean  = 0.0
+        self.var   = 1.0
+        self.count = epsilon
+
+    def update(self, x: np.ndarray):
+        """用一批 rewards 更新统计量（Welford batch 更新）。"""
+        batch_mean = x.mean()
+        batch_var  = x.var()
+        batch_count = len(x)
+        total = self.count + batch_count
+        delta = batch_mean - self.mean
+        self.mean  = self.mean + delta * batch_count / total
+        self.var   = (self.var * self.count
+                      + batch_var * batch_count
+                      + delta**2 * self.count * batch_count / total) / total
+        self.count = total
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
+
     """存储一个 episode 的全部轨迹"""
     def __init__(self):
         self.clear()
@@ -328,6 +384,10 @@ def train(n_episodes=N_EPISODES,
     opt_m = optim.Adam(
         list(machine_policy.parameters()) + list(machine_value.parameters()), lr=LR)
 
+    # Running reward normalization：归一化 rewards 而非 returns
+    # 保证 returns 和 v_pred 的尺度一致，避免 value loss 爆炸或塌陷
+    rms = RunningMeanStd()
+
     history = {k: [] for k in
                ["reward", "makespan", "mto_tard", "mts_tard",
                 "loss_o", "loss_m", "entropy_o", "entropy_m"]}
@@ -358,8 +418,13 @@ def train(n_episodes=N_EPISODES,
         T       = len(buf)
 
         if T > 0:
-            scaled_r = buf.rewards.copy()
-            full_d   = buf.dones.copy()
+            raw_r  = np.array(buf.rewards, dtype=np.float32)
+            full_d = buf.dones.copy()
+
+            # 用 running statistics 归一化 rewards（不动 returns 本身）
+            # 保持 advantages 和 returns 在同一尺度，value 网络有稳定的学习目标
+            rms.update(raw_r)
+            scaled_r = rms.normalize(raw_r)
 
             # Bootstrap：若最后一个 episode 被截断
             if getattr(buf, '_truncated', False) and buf._last_flat is not None:
@@ -373,12 +438,7 @@ def train(n_episodes=N_EPISODES,
             adv_o, ret_o = compute_gae(scaled_r, buf.o_values, full_d, last_value=last_val_o)
             adv_m, ret_m = compute_gae(scaled_r, buf.m_values, full_d, last_value=last_val_m)
 
-            # Returns 归一化：消除量级差异，稳定 Value loss
-            ret_mean = np.mean(ret_o)
-            ret_std  = np.std(ret_o) + 1e-8
-            ret_o = (ret_o - ret_mean) / ret_std
-            ret_m = (ret_m - np.mean(ret_m)) / (np.std(ret_m) + 1e-8)
-
+            # 只归一化 advantages，不动 returns
             adv_o = (adv_o - adv_o.mean()) / (adv_o.std() + 1e-8)
             adv_m = (adv_m - adv_m.mean()) / (adv_m.std() + 1e-8)
 
