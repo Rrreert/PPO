@@ -64,34 +64,23 @@ class OrderPolicyNet(nn.Module):
         return log_probs, entropy
 
 
-VALUE_INPUT_DIM = ORDER_FEAT_DIM*2 + MACHINE_FEAT_DIM*2 + GLOBAL_FEAT_DIM  # 33*2+5*2+2 = 78
-
-
 class OrderValueNet(nn.Module):
-    """
-    修复：sum-pool + max-pool 替代 mean-pool，信息保留提升 ~3×
-    输入 78 维 = [order_sum(33), order_max(33), mach_sum(5), mach_max(5), global(2)]
-    """
-    def __init__(self, hidden=128):
+    def __init__(self, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(VALUE_INPUT_DIM, hidden),
-            nn.LayerNorm(hidden),
+            nn.Linear(VALUE_COMPRESSED_DIM, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 64),
+            nn.Linear(hidden, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, flat_state):
         B = flat_state.shape[0]
-        o_all = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM)
-        m_all = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM)
+        o = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM).mean(1)
+        m = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM).mean(1)
         g = flat_state[:, -GLOBAL_FEAT_DIM:]
-        # sum + max 拼接，保留分布信息
-        o_agg = torch.cat([o_all.sum(1), o_all.max(1).values], dim=-1)   # [B, 66]
-        m_agg = torch.cat([m_all.sum(1), m_all.max(1).values], dim=-1)   # [B, 10]
-        return self.net(torch.cat([o_agg, m_agg, g], dim=-1)).squeeze(-1)
+        return self.net(torch.cat([o, m, g], dim=-1)).squeeze(-1)
 
 
 # ---------- 设备智能体 ----------
@@ -117,28 +106,22 @@ class MachinePolicyNet(nn.Module):
 
 
 class MachineValueNet(nn.Module):
-    """
-    修复：同 OrderValueNet，使用 sum+max pool
-    """
-    def __init__(self, hidden=128):
+    def __init__(self, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(VALUE_INPUT_DIM, hidden),
-            nn.LayerNorm(hidden),
+            nn.Linear(VALUE_COMPRESSED_DIM, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 64),
+            nn.Linear(hidden, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, flat_state):
         B = flat_state.shape[0]
-        o_all = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM)
-        m_all = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM)
+        o = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM).mean(1)
+        m = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM).mean(1)
         g = flat_state[:, -GLOBAL_FEAT_DIM:]
-        o_agg = torch.cat([o_all.sum(1), o_all.max(1).values], dim=-1)
-        m_agg = torch.cat([m_all.sum(1), m_all.max(1).values], dim=-1)
-        return self.net(torch.cat([o_agg, m_agg, g], dim=-1)).squeeze(-1)
+        return self.net(torch.cat([o, m, g], dim=-1)).squeeze(-1)
 
 
 # ---------- 输入构造工具 ----------
@@ -207,4 +190,3 @@ if __name__ == '__main__':
     mh = torch.rand(1, 3, MACHINE_HEURISTIC_DIM)
     lp2, ent2 = mp(mc, mh)
     print(f"MachinePolicy log_probs: {lp2.shape}, entropy: {ent2.item():.4f}  ✓")
-    
