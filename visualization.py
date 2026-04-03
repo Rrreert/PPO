@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from environment import ORDERS, OPS, N_ORDERS
 
-plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.family'] = ['WenQuanYi Zen Hei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 颜色映射：订单
@@ -165,18 +165,17 @@ def make_tardiness_table(env, save_path='tardiness_table.csv'):
     rows = []
     for os in env.order_states:
         tard = os.tardiness() / 60  # 转分钟
-        if tard > 0:
-            info = order_id_to_info[os.id]
-            ct   = (os.completion_time() or 0) / 60
-            rows.append({
-                '订单编号': os.id,
-                '产品型号': os.product_type,
-                '产品数量': info['quantity'],
-                '生产方式': info['mode'],
-                '交货时间(分钟)': info['due_time'],
-                '实际完工时间(分钟)': round(ct, 1),
-                '拖期时间(分钟)': round(tard, 1),
-            })
+        info = order_id_to_info[os.id]
+        ct   = (os.completion_time() or 0) / 60
+        rows.append({
+            '订单编号': os.id,
+            '产品型号': os.product_type,
+            '产品数量': info['quantity'],
+            '生产方式': info['mode'],
+            '交货时间(分钟)': info['due_time'],
+            '实际完工时间(分钟)': round(ct, 1),
+            '拖期时间(分钟)': round(tard, 1),
+        })
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -188,14 +187,17 @@ def make_tardiness_table(env, save_path='tardiness_table.csv'):
 
 def run_multiple_episodes(n_eval, env, order_policy, order_value,
                           machine_policy, machine_value):
-    """运行多个 episode 收集箱线图数据"""
+    """
+    运行多个 episode 收集箱线图数据。
+    使用随机采样（training=True）而非贪心，使每次结果有真实方差，
+    """
     from trainer import run_episode, RolloutBuffer
     makespans, mto_tards, mts_tards = [], [], []
     dummy_buf = RolloutBuffer()
     for _ in range(n_eval):
         dummy_buf.clear()
         run_episode(env, order_policy, order_value,
-                    machine_policy, machine_value, dummy_buf, training=False)
+                    machine_policy, machine_value, dummy_buf, training=True)  # 随机采样
         m = env.get_metrics()
         makespans.append(m['makespan'])
         mto_tards.append(m['mto_tardiness'])
