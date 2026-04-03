@@ -15,8 +15,12 @@ MACHINE_HEURISTIC_DIM = 4
 ORDER_CONTEXT_DIM     = ORDER_FEAT_DIM + GLOBAL_FEAT_DIM + MACHINE_FEAT_DIM   # 40
 MACHINE_CONTEXT_DIM   = MACHINE_FEAT_DIM + ORDER_FEAT_DIM + GLOBAL_FEAT_DIM   # 40
 VALUE_COMPRESSED_DIM  = ORDER_FEAT_DIM + MACHINE_FEAT_DIM + GLOBAL_FEAT_DIM   # 40
-N_ORDERS   = 30
-N_MACHINES = 30
+
+
+def _get_env_counts():
+    from environment import N_ORDERS, N_MACHINES
+    return N_ORDERS, N_MACHINES
+N_ORDERS, N_MACHINES = _get_env_counts()
 
 
 class MLP(nn.Module):
@@ -77,7 +81,8 @@ class OrderValueNet(nn.Module):
 
     def forward(self, flat_state):
         B = flat_state.shape[0]
-        o = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM).mean(1)
+        n_ord = (flat_state.shape[1] - N_MACHINES*MACHINE_FEAT_DIM - GLOBAL_FEAT_DIM) // ORDER_FEAT_DIM
+        o = flat_state[:, :n_ord*ORDER_FEAT_DIM].view(B, n_ord, ORDER_FEAT_DIM).mean(1)
         m = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM).mean(1)
         g = flat_state[:, -GLOBAL_FEAT_DIM:]
         return self.net(torch.cat([o, m, g], dim=-1)).squeeze(-1)
@@ -118,7 +123,8 @@ class MachineValueNet(nn.Module):
 
     def forward(self, flat_state):
         B = flat_state.shape[0]
-        o = flat_state[:, :N_ORDERS*ORDER_FEAT_DIM].view(B, N_ORDERS, ORDER_FEAT_DIM).mean(1)
+        n_ord = (flat_state.shape[1] - N_MACHINES*MACHINE_FEAT_DIM - GLOBAL_FEAT_DIM) // ORDER_FEAT_DIM
+        o = flat_state[:, :n_ord*ORDER_FEAT_DIM].view(B, n_ord, ORDER_FEAT_DIM).mean(1)
         m = flat_state[:, N_ORDERS*ORDER_FEAT_DIM:N_ORDERS*ORDER_FEAT_DIM+N_MACHINES*MACHINE_FEAT_DIM].view(B, N_MACHINES, MACHINE_FEAT_DIM).mean(1)
         g = flat_state[:, -GLOBAL_FEAT_DIM:]
         return self.net(torch.cat([o, m, g], dim=-1)).squeeze(-1)

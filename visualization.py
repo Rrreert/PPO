@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from environment import ORDERS, OPS, N_ORDERS
 
-plt.rcParams['font.family'] = ['Noto Sans CJK JP', 'DejaVu Sans']
+plt.rcParams['font.family'] = ['Noto Sans CJK SC', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 颜色映射：订单
