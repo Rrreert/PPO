@@ -1,6 +1,6 @@
 """主程序入口"""
 import sys, os
-sys.path.insert(0, '/home/claude/scheduler')
+sys.path.insert(0, '/kaggle/working/PPO/v2')
 
 import torch
 import numpy as np
@@ -13,7 +13,7 @@ from ppo_trainer import train, evaluate, run_episode
 from visualize import (plot_gantt, plot_boxplots, plot_training_curves,
                        save_training_table, save_tardiness_table)
 
-OUTPUT_DIR = '/mnt/user-data/outputs'
+OUTPUT_DIR = '/kaggle/working/PPO/v2/outputs'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def set_seed(seed=42):
@@ -33,8 +33,8 @@ def main():
     print(f"  设备: {len(data['all_devices'])}台, 型号: {len(data['product_types'])}种")
     print(f"  故障事件: {len(data['maintenance'])}条")
 
-    print("\n[2/5] PPO训练 (100轮)...")
-    agent, history = train(data, num_episodes=100)
+    print("\n[2/5] PPO训练 (500轮)...")
+    agent, history = train(data, num_episodes=500)
 
     print("\n[3/5] 评估（20次运行）...")
     eval_results, _ = evaluate(data, agent, n_runs=20)

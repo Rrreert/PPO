@@ -2,7 +2,7 @@
 import pandas as pd
 import numpy as np
 
-DATA_PATH = "/mnt/user-data/uploads/data_dy.xlsx"
+DATA_PATH = "/kaggle/working/PPO/v2/data_dy.xlsx"
 
 def load_all_data():
     xl = pd.read_excel(DATA_PATH, sheet_name=None, header=None)
