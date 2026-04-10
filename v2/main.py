@@ -37,7 +37,7 @@ def main():
     agent, history = train(data, num_episodes=500)
 
     print("\n[3/5] 评估（20次运行）...")
-    eval_results, _ = evaluate(data, agent, n_runs=20)
+    eval_results, _ = evaluate(data, agent, n_runs=100)
 
     # 单独跑一次greedy episode做甘特图
     env_gantt = ShopFloorEnv(data)
