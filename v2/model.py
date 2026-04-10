@@ -73,16 +73,16 @@ class LightHeteroGNN(nn.Module):
 
 
 class SchedulingAgent(nn.Module):
-    def __init__(self, hidden=HIDDEN_DIM):
+    def __init__(self, hidden=HIDDEN_DIM, global_dim=4):
         super().__init__()
         self.gnn = LightHeteroGNN(hidden)
         self.actor = nn.Sequential(
-            nn.Linear(hidden * 2 + 2, hidden),
+            nn.Linear(hidden * 2 + global_dim, hidden),
             nn.ELU(),
             nn.Linear(hidden, 1)
         )
         self.critic = nn.Sequential(
-            nn.Linear(hidden + 2, hidden // 2),
+            nn.Linear(hidden + global_dim, hidden // 2),
             nn.ELU(),
             nn.Linear(hidden // 2, 1)
         )
