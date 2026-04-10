@@ -267,7 +267,7 @@ def ppo_update(agent, optimizer, trajectory, critic_only=False):
             total_entropy/n_updates if n_updates else 0.0)
 
 
-def train_v3(data, num_episodes=300):
+def train(data, num_episodes=300):
     agent = SchedulingAgent(hidden=64)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -278,7 +278,7 @@ def train_v3(data, num_episodes=300):
     best_ms = float('inf')
     WARMUP = 20  # 前20轮只训练Critic
 
-    print(f"训练 V3，共 {num_episodes} 轮（前{WARMUP}轮Critic预热）...")
+    print(f"训练，共 {num_episodes} 轮（前{WARMUP}轮Critic预热）...")
     print(f"EDD基线: makespan~3910min, 加权拖期~956min\n")
 
     for ep in range(num_episodes):
@@ -313,7 +313,7 @@ def train_v3(data, num_episodes=300):
     return agent, history
 
 
-def evaluate_v3(data, agent, n_runs=20):
+def evaluate(data, agent, n_runs=20):
     results = []
     last_env = None
     for i in range(n_runs):
