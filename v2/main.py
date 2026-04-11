@@ -43,7 +43,7 @@ def main():
     print(f"  设备: {len(data['all_devices'])}台, 型号: {len(data['product_types'])}种")
     print(f"  故障事件: {len(data['maintenance'])}条")
 
-    print("\n[2/5] PPO训练 ({args.num_episodes}轮)...")
+    print(f"\n[2/5] PPO训练 ({args.num_episodes}轮)...")
     agent, history = train(data, num_episodes=args.num_episodes)
 
     print(f"\n[3/5] 评估（{args.eval_episodes}次运行）...")
