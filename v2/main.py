@@ -22,6 +22,16 @@ def set_seed(seed=42):
     random.seed(seed)
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='PPO训练测试')
+    parser.add_argument('--num_episodes', type=int, default=500,
+                       help='训练轮数')
+    parser.add_argument('--eval_episodes', type=int, default=100,
+                       help='评估轮数')
+    
+    args = parser.parse_args()
+
     set_seed(42)
     print("=" * 60)
     print("  基于异构图的动态车间调度系统 (PPO)")
@@ -33,11 +43,11 @@ def main():
     print(f"  设备: {len(data['all_devices'])}台, 型号: {len(data['product_types'])}种")
     print(f"  故障事件: {len(data['maintenance'])}条")
 
-    print("\n[2/5] PPO训练 (500轮)...")
-    agent, history = train(data, num_episodes=500)
+    print("\n[2/5] PPO训练 ({args.num_episodes}轮)...")
+    agent, history = train(data, num_episodes=args.num_episodes)
 
-    print("\n[3/5] 评估（20次运行）...")
-    eval_results, _ = evaluate(data, agent, n_runs=100)
+    print(f"\n[3/5] 评估（{args.eval_episodes}次运行）...")
+    eval_results, _ = evaluate(data, agent, n_runs=args.eval_episodes)
 
     # 单独跑一次greedy episode做甘特图
     env_gantt = ShopFloorEnv(data)
