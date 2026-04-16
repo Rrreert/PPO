@@ -44,7 +44,7 @@ def main():
     t1 = time.time()
     ppo_summary = run_ppo(
         G, flights, pos,
-        total_timesteps=150_000,  # 可调大提升效果
+        total_timesteps=3000000,
         force_retrain=True
     )
     print(f"  PPO total time: {time.time()-t1:.1f}s")
@@ -70,15 +70,15 @@ def main():
     # ── 6. 可视化 ─────────────────────────────
     print("\n[Step 5] Generating visualizations...")
     generate_full_report(dijk_summary, ppo_summary, G, pos,
-                         output_path="/mnt/user-data/outputs/taxi_comparison_report.png")
+                         output_path="/kaggle/working/PPO/airport/taxi_comparison_report.png")
     generate_route_detail(dijk_summary, G, pos,
-                          output_path="/mnt/user-data/outputs/dijkstra_routes.png",
+                          output_path="/kaggle/working/PPO/airport/dijkstra_routes.png",
                           title_prefix="Dijkstra")
     generate_route_detail(ppo_summary, G, pos,
-                          output_path="/mnt/user-data/outputs/ppo_routes.png",
+                          output_path="/kaggle/working/PPO/airport/ppo_routes.png",
                           title_prefix="PPO")
 
-    print("\n[Done] All outputs saved to /mnt/user-data/outputs/")
+    print("\n[Done] All outputs saved to /kaggle/working/PPO/airport/")
     return dijk_summary, ppo_summary
 
 
