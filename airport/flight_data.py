@@ -194,8 +194,8 @@ def load_flights(dep_csv: str, arr_csv: str, graph_nodes: set, pos: dict) -> lis
 
 if __name__ == "__main__":
     import os, sys
-    os.chdir("/home/claude")
-    sys.path.insert(0, "/home/claude")
+    os.chdir("/kaggle/working/PPO/airport/")
+    sys.path.insert(0, "/kaggle/working/PPO/airport/")
     from airport_graph import build_graph
     G, pos = build_graph("虹桥点.csv")
     flights = load_flights("出港航班0407.csv", "进港航班0407.csv", set(G.nodes()), pos)

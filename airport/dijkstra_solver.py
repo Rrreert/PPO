@@ -253,8 +253,8 @@ def run_dijkstra(G: nx.Graph, flights: list, pos: dict) -> dict:
 
 if __name__ == "__main__":
     import os, sys
-    os.chdir("/home/claude")
-    sys.path.insert(0, "/home/claude")
+    os.chdir("/kaggle/working/PPO/airport/")
+    sys.path.insert(0, "/kaggle/working/PPO/airport/")
     from airport_graph import build_graph
     from flight_data import load_flights
     G, pos = build_graph("虹桥点.csv")

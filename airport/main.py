@@ -3,8 +3,8 @@ main.py
 主程序：构建图 → Dijkstra → 训练PPO → 推理 → 可视化对比
 """
 import os, sys, time
-os.chdir("/home/claude")
-sys.path.insert(0, "/home/claude")
+os.chdir("/kaggle/working/PPO/airport/")
+sys.path.insert(0, "/kaggle/working/PPO/airport/")
 
 import numpy as np
 import warnings
