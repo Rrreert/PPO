@@ -17,10 +17,10 @@ from airport_graph import FORBIDDEN_NODES, get_restricted_graph
 from dijkstra_solver import compute_flight_metrics, _angle_at_node
 
 # ─── PPO 奖励权重（推荐初始值） ───────────────
-W_TIME     = -0.010   # 每秒时间惩罚
-W_CARBON   = -0.050   # 每 kg CO2 惩罚
-W_SAFE     = -5.000   # 安全距离奖励（惩罚）系数
-W_PROGRESS =  1.000   # 进度奖励系数
+W_TIME     = -0.005   # 每秒时间惩罚
+W_CARBON   = -0.020   # 每 kg CO2 惩罚
+W_SAFE     = -2.000   # 安全距离奖励（惩罚）系数
+W_PROGRESS =  2.000   # 进度奖励系数
 
 MAX_STEPS  = 3000     # 单 episode 最大步数
 MAX_NEIGHBORS = 8     # 最大邻居数（动作空间上界）
@@ -101,7 +101,7 @@ class TaxiEnv(gym.Env):
         self.speed = 0.0
         self.path_taken = [self.current_node]
         self.total_co2 = 0.0
-        self.prev_dist = self._dist_to_goal(self.current_node)
+        self.prev_dist = nx.dijkstra_path_length(self.G_restricted, self.current_node, self.goal, weight='weight')
         self.done_flag = False
         self.t_global = self.flight['actual_time']
 
@@ -228,8 +228,8 @@ class TaxiEnv(gym.Env):
             r_safe = 0.0
 
         # 4. 进度奖励
-        new_dist = self._dist_to_goal(next_node)
-        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / max(self.max_dist, 1.0)
+        new_dist = nx.dijkstra_path_length(self.G_restricted, next_node, self.goal, weight='weight')
+        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
         self.prev_dist = new_dist
 
         reward = r_time + r_carbon + r_safe + r_progress
@@ -245,7 +245,7 @@ class TaxiEnv(gym.Env):
         info = {}
 
         if self.current_node == self.goal:
-            reward += 50.0  # 到达奖励
+            reward += 200.0  # 到达奖励
             terminated = True
             info['reason'] = 'reached_goal'
         elif min_dist < D_MIN:
