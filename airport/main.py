@@ -17,6 +17,13 @@ from ppo_solver import run_ppo
 from visualize import generate_full_report, generate_route_detail
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='PPO训练测试')
+    parser.add_argument('--total_timesteps', type=int, default=1000000,
+                       help='训练轮数')
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  Hongqiao Airport Taxi Optimization")
     print("  PPO vs Dijkstra Comparison")
@@ -44,7 +51,7 @@ def main():
     t1 = time.time()
     ppo_summary = run_ppo(
         G, flights, pos,
-        total_timesteps=3000000,
+        total_timesteps=args.total_timesteps,
         force_retrain=True
     )
     print(f"  PPO total time: {time.time()-t1:.1f}s")
