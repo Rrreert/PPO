@@ -117,23 +117,26 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
     return model
 
 
-def dijkstra_with_conflict_penalty(G, src, dst, occupied, t_current, pos):
+def dijkstra_with_conflict_penalty(G: nx.Graph, src: str, dst: str,
+                                     occupied: dict, t_current: float,
+                                     pos: dict) -> list:
     """
-    用带惩罚的边权重，让Dijkstra补全时也绕开已占用路径
+    带冲突惩罚的 Dijkstra 补全：被占用的边权重×10，绕开已规划飞机的路径。
     """
     G_penalized = G.copy()
-    for u, v, data in G.edges(data=True):
-        base_w = data.get('weight', 1.0)
-        # 检查这条边在当前时刻是否被占用
-        mid_xy = (np.array(pos[u]) + np.array(pos[v])) / 2
-        t_key = int(t_current)
-        penalty = 0.0
-        if t_key in occupied:
-            for _, occ_xy in occupied[t_key]:
-                if np.linalg.norm(mid_xy - np.array(occ_xy)) < 200:
-                    penalty = base_w * 10  # 被占用的边权重×10
-                    break
-        G_penalized[u][v]['weight'] = base_w + penalty
+    t_key = int(t_current)
+    # 只在有占用数据时才做惩罚计算，避免无谓遍历
+    if t_key in occupied:
+        occ_positions = [np.array(xy) for _, xy in occupied[t_key]]
+        for u, v, data in G.edges(data=True):
+            if u not in pos or v not in pos:
+                continue
+            base_w = data.get('weight', 1.0)
+            mid_xy = (np.array(pos[u]) + np.array(pos[v])) / 2.0
+            for occ_xy in occ_positions:
+                if np.linalg.norm(mid_xy - occ_xy) < 200.0:
+                    G_penalized[u][v]['weight'] = base_w * 10.0
+                    break  # 一个冲突就够了，不需要继续检查
     return nx.dijkstra_path(G_penalized, src, dst, weight='weight')
 
 
@@ -175,19 +178,17 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
     if env.current_node != flight['end_node']:
         src = env.current_node
         dst = flight['end_node']
-
-        # current_time = flight['actual_time'] + len(env.path_taken)
-
         src_use = src if src in Gr else (dst if dst in Gr else src)
         dst_use = dst if dst in Gr else src
+        t_current = env.t_global  # 取当前仿真时刻，用于冲突判断
         try:
-            rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
-            # rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, current_time, pos)
+            # rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
+            rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, t_current, pos)
             path = path + rest[1:]
         except:
             try:
-                rest = nx.dijkstra_path(G, src, dst, weight='weight')
-                # rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, current_time, pos)
+                # rest = nx.dijkstra_path(G, src, dst, weight='weight')
+                rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, t_current, pos)
                 path = path + rest[1:]
             except:
                 path.append(flight['end_node'])
