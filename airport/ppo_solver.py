@@ -83,7 +83,7 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
     dijk_summary = run_dijkstra(G, flights, pos)
     static_occupied = _build_occupied(dijk_summary['results'], pos)
 
-    env_fns = [make_env_fn(G, pos, flights, i, static_occupied) 
+    env_fns = [make_env_fn(G, pos, flights, i, [static_occupied]) 
                for i in range(n_envs)]
     # env_fns = [make_env_fn(G, pos, flights, i) for i in range(n_envs)]
     from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
