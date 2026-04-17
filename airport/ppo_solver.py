@@ -60,11 +60,13 @@ def _build_occupied(prev_results: list, pos: dict) -> dict:
     return dict(occ)
 
 
-def make_env_fn(G, pos, flights, idx=0):
+def make_env_fn(G, pos, flights, idx=0, occupied_ref=None):
     """工厂函数：为 VecEnv 创建环境"""
     def _make():
         fl = flights[idx % len(flights)]
-        return TaxiEnv(G, pos, fl, occupied_positions={})
+        # 使用共享的 occupied 引用，训练时也能看到其他飞机
+        occ = occupied_ref[0] if occupied_ref else {}
+        return TaxiEnv(G, pos, fl, occupied_positions=occ)
     return _make
 
 
@@ -76,8 +78,14 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
     """
     print(f"[PPO] Training for {total_timesteps} steps with {n_envs} envs...")
 
-    # 多环境训练（轮流使用不同航班）
-    env_fns = [make_env_fn(G, pos, flights, i) for i in range(n_envs)]
+    # 先用 Dijkstra 生成初始占用表作为训练背景
+    from dijkstra_solver import run_dijkstra
+    dijk_summary = run_dijkstra(G, flights, pos)
+    static_occupied = _build_occupied(dijk_summary['results'], pos)
+
+    env_fns = [make_env_fn(G, pos, flights, i, static_occupied) 
+               for i in range(n_envs)]
+    # env_fns = [make_env_fn(G, pos, flights, i) for i in range(n_envs)]
     from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
     vec_env = DummyVecEnv(env_fns)
 
@@ -136,7 +144,9 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
             break
         # 检测循环
         if visit_count.get(node, 0) > MAX_VISIT:
-            break
+            # 找到这个节点第一次出现的位置，截断
+            first_idx = env.path_taken.index(node)
+            path = env.path_taken[:first_idx + 1]
 
     path = env.path_taken[:]
 

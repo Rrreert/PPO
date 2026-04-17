@@ -54,10 +54,10 @@ class TaxiEnv(gym.Env):
         #  到目标剩余距离（归一化）,
         #  当前速度（归一化）,
         #  最近冲突飞机距离（归一化）,
-        #  邻居1..8 可用性（0/1）]
-        obs_dim = 7 + max_neighbors
+        #  邻居1..8 各自的 (dx, dy, dist) 共 max_neighbors*3 维]
+        obs_dim = 7 + max_neighbors * 3
         self.observation_space = spaces.Box(
-            low=-1.0, high=2.0, shape=(obs_dim,), dtype=np.float32)
+            low=-2.0, high=2.0, shape=(obs_dim,), dtype=np.float32)
 
         # 坐标归一化
         xs = [v[0] for v in pos.values()]
@@ -101,7 +101,7 @@ class TaxiEnv(gym.Env):
         self.speed = 0.0
         self.path_taken = [self.current_node]
         self.total_co2 = 0.0
-        self.prev_dist = nx.dijkstra_path_length(self.G_restricted, self.current_node, self.goal, weight='weight')
+        self.prev_dist = self._dist_to_goal(self.current_node)
         self.done_flag = False
         self.t_global = self.flight['actual_time']
 
@@ -122,16 +122,21 @@ class TaxiEnv(gym.Env):
                 if nd < min_conf_dist:
                     min_conf_dist = nd
 
-        # 邻居可用性
+        # 邻居方向特征：每个邻居编码为 (dx, dy, dist)，无邻居处填0
         nbs = self._get_neighbors(self.current_node)
-        nb_avail = np.zeros(self.max_nb, dtype=np.float32)
-        for i, nb in enumerate(nbs):
-            if i < self.max_nb:
-                nb_avail[i] = 1.0
+        nb_features = np.zeros(self.max_nb * 3, dtype=np.float32)
+        cur_xy = np.array(self.pos.get(self.current_node, (0.0, 0.0)))
+        for i, nb in enumerate(nbs[:self.max_nb]):
+            if nb in self.pos:
+                nb_xy = np.array(self.pos[nb])
+                dx = (nb_xy[0] - cur_xy[0]) / self.xy_scale
+                dy = (nb_xy[1] - cur_xy[1]) / self.xy_scale
+                d  = np.linalg.norm([dx, dy])
+                nb_features[i*3:i*3+3] = [dx, dy, d]
 
         obs = np.array([cx, cy, gx, gy, dist_norm, speed_norm,
                         min_conf_dist], dtype=np.float32)
-        obs = np.concatenate([obs, nb_avail])
+        obs = np.concatenate([obs, nb_features])
         return obs
 
     def reset(self, seed=None, options=None):
@@ -149,8 +154,8 @@ class TaxiEnv(gym.Env):
             self.done_flag = True
             return self._get_obs(), -50.0, True, False, {'reason': 'dead_end'}
 
-        # 动作裁剪
-        action = action % len(nbs)
+        # 动作裁剪：clip 到有效邻居范围，避免取模导致的动作分布偏斜
+        action = min(int(action), len(nbs) - 1)
         next_node = nbs[action]
 
         # ── 运动物理 ───────────────────────────
@@ -228,7 +233,7 @@ class TaxiEnv(gym.Env):
             r_safe = 0.0
 
         # 4. 进度奖励
-        new_dist = nx.dijkstra_path_length(self.G_restricted, next_node, self.goal, weight='weight')
+        new_dist = self._dist_to_goal(next_node)
         r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
         self.prev_dist = new_dist
 
