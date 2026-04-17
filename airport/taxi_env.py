@@ -266,5 +266,5 @@ class TaxiEnv(gym.Env):
             info['reason'] = 'timeout'
 
         self.done_flag = terminated or truncated
-        reward = np.clip(reward, -20.0, 20.0)
+        reward = np.clip(reward, -50.0, 50.0)
         return self._get_obs(), float(reward), terminated, truncated, info

@@ -9,6 +9,7 @@ import networkx as nx
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.utils import get_linear_fn
 from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
@@ -99,7 +100,7 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=get_linear_fn(0.05, 0.005, 1.0),
         vf_coef=1.0,
         max_grad_norm=0.3,
         verbose=1,
