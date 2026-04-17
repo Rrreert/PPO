@@ -99,7 +99,7 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.05,
+        ent_coef=0.03,
         vf_coef=1.0,
         max_grad_norm=0.3,
         verbose=1,
@@ -176,18 +176,18 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
         src = env.current_node
         dst = flight['end_node']
 
-        current_time = flight['actual_time'] + len(env.path_taken)
+        # current_time = flight['actual_time'] + len(env.path_taken)
 
         src_use = src if src in Gr else (dst if dst in Gr else src)
         dst_use = dst if dst in Gr else src
         try:
-            # rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
-            rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, current_time, pos)
+            rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
+            # rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, current_time, pos)
             path = path + rest[1:]
         except:
             try:
-                # rest = nx.dijkstra_path(G, src, dst, weight='weight')
-                rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, current_time, pos)
+                rest = nx.dijkstra_path(G, src, dst, weight='weight')
+                # rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, current_time, pos)
                 path = path + rest[1:]
             except:
                 path.append(flight['end_node'])
