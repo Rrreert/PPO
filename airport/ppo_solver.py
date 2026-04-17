@@ -100,10 +100,11 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
+        vf_coef=1.0,
+        max_grad_norm=0.3,
         verbose=1,
         tensorboard_log=None,
+        normalize_advantage=True,
         policy_kwargs=dict(net_arch=[256, 256]),
     )
 
