@@ -117,11 +117,31 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
     return model
 
 
+def dijkstra_with_conflict_penalty(G, src, dst, occupied, t_current, pos):
+    """
+    用带惩罚的边权重，让Dijkstra补全时也绕开已占用路径
+    """
+    G_penalized = G.copy()
+    for u, v, data in G.edges(data=True):
+        base_w = data.get('weight', 1.0)
+        # 检查这条边在当前时刻是否被占用
+        mid_xy = (np.array(pos[u]) + np.array(pos[v])) / 2
+        t_key = int(t_current)
+        penalty = 0.0
+        if t_key in occupied:
+            for _, occ_xy in occupied[t_key]:
+                if np.linalg.norm(mid_xy - np.array(occ_xy)) < 200:
+                    penalty = base_w * 10  # 被占用的边权重×10
+                    break
+        G_penalized[u][v]['weight'] = base_w + penalty
+    return nx.dijkstra_path(G_penalized, src, dst, weight='weight')
+
+
 def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
                     flight: dict, occupied: dict) -> dict:
     """
     用训练好的模型为单架飞机执行推理，返回路径和指标。
-    快速模式：最多走 500 步，超过则直接 Dijkstra 补全。
+    快速模式：最多走 1500 步，超过则直接 Dijkstra 补全。
     """
     from airport_graph import get_restricted_graph as _get_rest
     Gr = _get_rest(G)
@@ -133,7 +153,7 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
     visit_count = {}
     MAX_VISIT = 3  # 同一节点最多经过3次，否则用Dijkstra补全
 
-    while not done and step < 500:
+    while not done and step < 1500:
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(int(action))
         node = env.current_node
@@ -155,14 +175,19 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
     if env.current_node != flight['end_node']:
         src = env.current_node
         dst = flight['end_node']
+
+        current_time = flight['actual_time'] + len(env.path_taken)
+
         src_use = src if src in Gr else (dst if dst in Gr else src)
         dst_use = dst if dst in Gr else src
         try:
-            rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
+            # rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
+            rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, current_time, pos)
             path = path + rest[1:]
         except:
             try:
-                rest = nx.dijkstra_path(G, src, dst, weight='weight')
+                # rest = nx.dijkstra_path(G, src, dst, weight='weight')
+                rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, current_time, pos)
                 path = path + rest[1:]
             except:
                 path.append(flight['end_node'])
