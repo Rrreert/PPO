@@ -102,6 +102,8 @@ class TaxiEnv(gym.Env):
         self.path_taken = [self.current_node]
         self.total_co2 = 0.0
         self.prev_dist = self._dist_to_goal(self.current_node)
+        self.init_dist = self.prev_dist
+        self.traveled_dist = 0.0
         self.done_flag = False
         self.t_global = self.flight['actual_time']
 
@@ -178,6 +180,7 @@ class TaxiEnv(gym.Env):
         seg_len = np.linalg.norm(
             np.array(self.pos.get(next_node, (0,0))) -
             np.array(self.pos.get(self.current_node, (0,0))))
+        self.traveled_dist += seg_len
 
         # 加速/减速时间
         a_eff = ACCEL if v_target > self.speed else DECEL
@@ -234,7 +237,7 @@ class TaxiEnv(gym.Env):
 
         # 4. 进度奖励
         new_dist = self._dist_to_goal(next_node)
-        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
+        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / max(self.init_dist, 1.0)
         self.prev_dist = new_dist
 
         reward = r_time + r_carbon + r_safe + r_progress
@@ -250,7 +253,8 @@ class TaxiEnv(gym.Env):
         info = {}
 
         if self.current_node == self.goal:
-            reward += 200.0  # 到达奖励
+            efficiency = self.init_dist / max(self.traveled_dist, 1.0)
+            reward += 200.0 * min(efficiency, 1.0)  # 到达奖励
             terminated = True
             info['reason'] = 'reached_goal'
         elif min_dist < D_MIN:
