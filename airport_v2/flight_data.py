@@ -28,6 +28,9 @@ DT            = 1.0         # 仿真时间步长 (s)
 D_MIN  = 50.0   # m  碰撞距离（episode 重置）
 D_SAFE = 200.0  # m  预警距离
 
+# 跑道占用窗口（秒）：进港落地时间前后 / 出港到达端点前后各 40 秒视为占用
+RUNWAY_OCCUPY_WINDOW = 40  # s
+
 
 def _find_nearest_stand(missing_stand_str: str, available_nodes: list, pos: dict) -> str:
     """按欧氏距离将缺失停机位号映射到最近的 S 节点"""
@@ -88,6 +91,56 @@ def _nearest_stand_euclidean(stand_raw, graph_nodes: set, pos: dict) -> str:
     # 最简单可靠：按编号差
     best = min(stand_nodes, key=lambda n: abs(node_num(n) - num))
     return best
+
+
+def build_runway_schedule(flights: list) -> dict:
+    """
+    根据航班列表构建跑道占用时间表。
+
+    规则：
+      - 进港航班：落地时间（actual_time）前后各 RUNWAY_OCCUPY_WINDOW 秒为占用
+      - 出港航班：起飞时间（actual_time）前后各 RUNWAY_OCCUPY_WINDOW 秒为占用
+
+    跑道 ID 映射：
+      - 跑道 '36R' → 'R18L'（R18L 系列节点所在跑道）
+      - 跑道 '36L' → 'R18R'（R18R 系列节点所在跑道）
+
+    返回：
+      {
+        'R18L': [(t_start, t_end), ...],   # 按时间排序
+        'R18R': [(t_start, t_end), ...],
+      }
+
+    使用方式（在 taxi_env / dijkstra_solver 中）：
+      schedule = build_runway_schedule(flights)
+      is_blocked = is_runway_occupied(schedule, 'R18L', t_now)
+    """
+    from collections import defaultdict
+    windows = defaultdict(list)
+
+    runway_id_map = {'36R': 'R18L', '36L': 'R18R'}
+
+    for fl in flights:
+        runway_str = fl.get('runway', '')
+        runway_id = runway_id_map.get(runway_str)
+        if runway_id is None:
+            continue
+        t = fl['actual_time']
+        windows[runway_id].append((t - RUNWAY_OCCUPY_WINDOW, t + RUNWAY_OCCUPY_WINDOW))
+
+    # 按起始时间排序，便于后续二分查找
+    return {rid: sorted(wins) for rid, wins in windows.items()}
+
+
+def is_runway_occupied(schedule: dict, runway_id: str, t: float) -> bool:
+    """
+    查询 runway_id 在时刻 t 是否被占用。
+    使用线性扫描（窗口数量有限，137架次以内性能足够）。
+    """
+    for t_start, t_end in schedule.get(runway_id, []):
+        if t_start <= t <= t_end:
+            return True
+    return False
 
 
 def load_flights(dep_csv: str, arr_csv: str, graph_nodes: set, pos: dict) -> list[dict]:

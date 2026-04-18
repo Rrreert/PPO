@@ -10,12 +10,21 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────
-# 禁止途经节点（不能穿越跑道）
+# 跑道节点归属
+# 允许穿越跑道，但需结合 runway_schedule 判断跑道是否被占用。
+# FORBIDDEN_NODES 保留为空集，供其他模块兼容性引用。
 # ─────────────────────────────────────────────
-FORBIDDEN_NODES = {
-    'R18R_H5', 'R18R_C3', 'R18R_H4', 'R18R_B7', 'R18R_H3',
-    'R18L_B6', 'R18L_A4', 'R18L_A3', 'R18L_B4', 'R18L_H4',
-    'R18L_A2', 'R18L_B1'
+FORBIDDEN_NODES = set()   # 不再硬性禁止任何节点
+
+# 跑道节点 → 跑道 ID 的映射
+# R18L 对应跑道 36R（进港落地/出港起飞均使用），R18R 对应跑道 36L
+RUNWAY_NODES = {
+    # R18L 跑道节点
+    'R18L_B6': 'R18L', 'R18L_A4': 'R18L', 'R18L_A3': 'R18L',
+    'R18L_B4': 'R18L', 'R18L_H4': 'R18L', 'R18L_A2': 'R18L', 'R18L_B1': 'R18L',
+    # R18R 跑道节点
+    'R18R_H5': 'R18R', 'R18R_C3': 'R18R', 'R18R_H4': 'R18R',
+    'R18R_B7': 'R18R', 'R18R_H3': 'R18R',
 }
 
 def build_graph(csv_path="虹桥点.csv") -> tuple[nx.Graph, dict]:
@@ -224,13 +233,12 @@ def build_graph(csv_path="虹桥点.csv") -> tuple[nx.Graph, dict]:
     return G, pos
 
 
-def get_restricted_graph(G: nx.Graph) -> nx.Graph:
-    """返回去掉禁止节点的图（用于路径规划）"""
-    Gr = G.copy()
-    for n in FORBIDDEN_NODES:
-        if n in Gr:
-            Gr.remove_node(n)
-    return Gr
+def get_full_graph(G: nx.Graph) -> nx.Graph:
+    """返回完整图（跑道节点已开放，不再删除任何节点）"""
+    return G
+
+# 兼容别名：其他模块中 import get_restricted_graph 不会报错
+get_restricted_graph = get_full_graph
 
 
 def euclidean(pos, u, v):

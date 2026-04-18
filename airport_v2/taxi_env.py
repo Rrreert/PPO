@@ -13,7 +13,8 @@ from gymnasium import spaces
 from collections import defaultdict
 from flight_data import (CARBON_FACTOR, ACCEL_FACTOR, MAX_SPEED,
                           TURN_SPEED, ACCEL, DECEL, DT, D_MIN, D_SAFE)
-from airport_graph import FORBIDDEN_NODES, get_restricted_graph
+from airport_graph import FORBIDDEN_NODES, RUNWAY_NODES, get_restricted_graph
+from flight_data import is_runway_occupied
 from dijkstra_solver import compute_flight_metrics, _angle_at_node
 
 # ─── PPO 奖励权重 ───────────────────────────────────
@@ -26,6 +27,9 @@ W_SAFE     = -2.000   # 安全距离惩罚系数不变
 W_PROGRESS =  3.000   # 增强进度奖励（原2.0），使向目标推进的信号更强
 W_SMOOTH   =  0.200   # 新增：路径平滑奖励，奖励直行、惩罚大角度转弯
 
+# 跑道占用惩罚：穿越被占用跑道是重大安全事故，惩罚远大于普通冲突
+W_RUNWAY_OCCUPIED = -500.0   # 穿越占用跑道的单次惩罚
+
 MAX_STEPS  = 3000     # 单 episode 最大步数
 MAX_NEIGHBORS = 8     # 最大邻居数（动作空间上界）
 
@@ -35,18 +39,21 @@ class TaxiEnv(gym.Env):
     单架飞机滑行环境。
     其他飞机的轨迹通过 occupied_positions（时间→[(node,xy)]）注入，
     用于冲突惩罚计算。
+    runway_schedule 提供跑道占用时间窗口，用于跑道穿越合法性判断。
     """
     metadata = {"render_modes": []}
 
     def __init__(self, G: nx.Graph, pos: dict, flight: dict,
                  occupied_positions: dict = None,
+                 runway_schedule: dict = None,
                  max_neighbors: int = MAX_NEIGHBORS):
         super().__init__()
         self.G_full = G
-        self.G_restricted = get_restricted_graph(G)
+        self.G_restricted = get_restricted_graph(G)  # 现在等同于完整图
         self.pos = pos
         self.flight = flight
         self.occupied = occupied_positions or {}
+        self.runway_schedule = runway_schedule or {}  # {runway_id: [(t_start,t_end),...]}
         self.max_nb = max_neighbors
 
         # ── 动作空间：离散，选择邻居索引 ─────────
@@ -58,8 +65,10 @@ class TaxiEnv(gym.Env):
         #  到目标剩余距离（归一化）,
         #  当前速度（归一化）,
         #  最近冲突飞机距离（归一化）,
+        #  R18L跑道是否被占用 (0/1),      ← 新增
+        #  R18R跑道是否被占用 (0/1),      ← 新增
         #  邻居1..8 各自的 (dx, dy, dist) 共 max_neighbors*3 维]
-        obs_dim = 7 + max_neighbors * 3
+        obs_dim = 9 + max_neighbors * 3   # 原7，新增2个跑道占用维度
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0, shape=(obs_dim,), dtype=np.float32)
 
@@ -70,7 +79,6 @@ class TaxiEnv(gym.Env):
         self.y_min, self.y_max = min(ys), max(ys)
         self.xy_scale = max(self.x_max - self.x_min,
                             self.y_max - self.y_min, 1.0)
-        # 最大可能距离（归一化用）
         self.max_dist = self.xy_scale * 2
 
         self._reset_state()
@@ -90,12 +98,22 @@ class TaxiEnv(gym.Env):
         )
 
     def _get_neighbors(self, node):
-        """返回受限图中的邻居列表（最多 max_nb 个）"""
-        G_use = self.G_restricted if node in self.G_restricted else self.G_full
+        """返回图中的邻居列表（最多 max_nb 个）。
+        跑道节点现已开放，不再静态过滤；跑道占用判断在 step() 的奖励中处理。
+        """
+        G_use = self.G_full
         nbs = list(G_use.neighbors(node))
-        # 排除禁用节点
-        nbs = [n for n in nbs if n not in FORBIDDEN_NODES]
         return nbs[:self.max_nb]
+
+    def _is_runway_blocked(self, node: str) -> bool:
+        """
+        判断 node 是否是跑道节点且当前时刻该跑道被占用。
+        被占用 = 有航班的 actual_time 在 [t - WINDOW, t + WINDOW] 内。
+        """
+        runway_id = RUNWAY_NODES.get(node)
+        if runway_id is None:
+            return False  # 非跑道节点，不受限制
+        return is_runway_occupied(self.runway_schedule, runway_id, self.t_global)
 
     def _reset_state(self):
         self.current_node = self.flight['start_node']
@@ -119,7 +137,7 @@ class TaxiEnv(gym.Env):
 
         # 最近冲突飞机距离
         cur_pos = np.array(self.pos.get(self.current_node, (0, 0)))
-        min_conf_dist = 1.0  # 归一化，1 = 没有冲突
+        min_conf_dist = 1.0
         t_key = int(self.t_global)
         if t_key in self.occupied:
             for _, xy in self.occupied[t_key]:
@@ -128,7 +146,11 @@ class TaxiEnv(gym.Env):
                 if nd < min_conf_dist:
                     min_conf_dist = nd
 
-        # 邻居方向特征：每个邻居编码为 (dx, dy, dist)，无邻居处填0
+        # 跑道占用状态（新增2维）：让策略能主动感知跑道是否空闲
+        r18l_blocked = 1.0 if is_runway_occupied(self.runway_schedule, 'R18L', self.t_global) else 0.0
+        r18r_blocked = 1.0 if is_runway_occupied(self.runway_schedule, 'R18R', self.t_global) else 0.0
+
+        # 邻居方向特征
         nbs = self._get_neighbors(self.current_node)
         nb_features = np.zeros(self.max_nb * 3, dtype=np.float32)
         cur_xy = np.array(self.pos.get(self.current_node, (0.0, 0.0)))
@@ -141,7 +163,7 @@ class TaxiEnv(gym.Env):
                 nb_features[i*3:i*3+3] = [dx, dy, d]
 
         obs = np.array([cx, cy, gx, gy, dist_norm, speed_norm,
-                        min_conf_dist], dtype=np.float32)
+                        min_conf_dist, r18l_blocked, r18r_blocked], dtype=np.float32)
         obs = np.concatenate([obs, nb_features])
         return obs
 
@@ -247,20 +269,28 @@ class TaxiEnv(gym.Env):
         r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
         self.prev_dist = new_dist
 
-        # 5. 路径平滑奖励（新增）
-        # 直行(angle≈0)得正奖励，大角度转弯(angle>90)得负奖励
-        # 归一化到[-1, 1]：cos(angle)=1直行, cos(angle)=-1 U形
+        # 5. 路径平滑奖励
         if len(self.path_taken) >= 2 and angle >= 0.0:
             r_smooth = W_SMOOTH * np.cos(np.radians(angle))
         else:
             r_smooth = 0.0
 
-        # 6. 循环惩罚（新增）
-        # 每次重访已走过节点额外扣分，抑制绕圈行为
-        visit_cnt = self.path_taken.count(next_node)  # 含本次
-        r_loop = -1.0 * max(0, visit_cnt - 1)  # 首次=0, 重复1次=-1, 重复2次=-2 ...
+        # 6. 循环惩罚
+        visit_cnt = self.path_taken.count(next_node)
+        r_loop = -1.0 * max(0, visit_cnt - 1)
 
-        reward = r_time + r_carbon + r_safe + r_progress + r_smooth + r_loop
+        # 7. 跑道占用惩罚（新增）
+        # 飞机进入跑道节点时，若该跑道当前被占用则施加重惩罚。
+        # 惩罚设为 W_RUNWAY_OCCUPIED（-500），远大于普通冲突惩罚，
+        # 使策略强烈倾向于在跑道空闲时才穿越。
+        runway_id = RUNWAY_NODES.get(next_node)
+        if runway_id is not None and is_runway_occupied(
+                self.runway_schedule, runway_id, self.t_global):
+            r_runway = W_RUNWAY_OCCUPIED
+        else:
+            r_runway = 0.0
+
+        reward = r_time + r_carbon + r_safe + r_progress + r_smooth + r_loop + r_runway
 
         # 更新状态
         self.current_node = next_node
@@ -273,11 +303,16 @@ class TaxiEnv(gym.Env):
         info = {}
 
         if self.current_node == self.goal:
-            reward += 200.0  # 到达奖励
+            reward += 200.0
             terminated = True
             info['reason'] = 'reached_goal'
+        elif runway_id is not None and r_runway < 0:
+            # 穿越占用跑道：episode 立即终止，附加额外惩罚
+            reward += W_RUNWAY_OCCUPIED
+            terminated = True
+            info['reason'] = 'runway_incursion'
         elif min_dist < D_MIN:
-            reward += W_SAFE * 100.0  # 碰撞大惩罚
+            reward += W_SAFE * 100.0
             terminated = True
             info['reason'] = 'collision'
         elif self.step_count >= MAX_STEPS:
@@ -285,5 +320,5 @@ class TaxiEnv(gym.Env):
             info['reason'] = 'timeout'
 
         self.done_flag = terminated or truncated
-        reward = np.clip(reward, -50.0, 50.0)
+        reward = np.clip(reward, -1000.0, 50.0)  # 下界放宽至-1000以容纳跑道惩罚
         return self._get_obs(), float(reward), terminated, truncated, info

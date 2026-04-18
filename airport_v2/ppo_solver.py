@@ -60,13 +60,14 @@ def _build_occupied(prev_results: list, pos: dict) -> dict:
     return dict(occ)
 
 
-def make_env_fn(G, pos, flights, idx=0, occupied_ref=None):
+def make_env_fn(G, pos, flights, idx=0, occupied_ref=None, runway_schedule=None):
     """工厂函数：为 VecEnv 创建环境"""
     def _make():
         fl = flights[idx % len(flights)]
-        # 使用共享的 occupied 引用，训练时也能看到其他飞机
         occ = occupied_ref[0] if occupied_ref else {}
-        return TaxiEnv(G, pos, fl, occupied_positions=occ)
+        return TaxiEnv(G, pos, fl,
+                       occupied_positions=occ,
+                       runway_schedule=runway_schedule or {})
     return _make
 
 
@@ -78,22 +79,27 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
 
     关键改动：
     1. 用 Dijkstra 结果预填充 occupied，让训练期间环境就能看到多机冲突
-    2. 增加 EntropyScheduleCallback，防止 entropy 过早坍缩
-    3. 扩大网络容量至 [256,256,128]，增强对复杂场景的表达力
-    4. 降低 ent_coef 初始值，配合回调动态调整
+    2. 构建 runway_schedule 并注入环境，让策略感知跑道占用
+    3. 增加 EntropyScheduleCallback，防止 entropy 过早坍缩
+    4. 扩大网络容量至 [256,256,128]
     """
     print(f"[PPO] Training for {total_timesteps} steps with {n_envs} envs...")
 
-    # ── 预填充 occupied（训练/推理分布对齐）────────────────────────
-    # 原问题：训练时 occupied 为空，策略从未在密集冲突场景下被训练，
-    # 导致推理时面对 137 架并发时冲突激增。
-    # 修复：用 Dijkstra 基线路径预先构建 occupied 作为训练背景。
+    # ── 预填充 occupied ──────────────────────────────────────────
     from dijkstra_solver import run_dijkstra
+    from flight_data import build_runway_schedule
     dijk_summary = run_dijkstra(G, flights, pos)
     static_occupied = _build_occupied(dijk_summary['results'], pos)
     print(f"[PPO] Pre-filled occupied table: {len(static_occupied)} time slots")
 
-    env_fns = [make_env_fn(G, pos, flights, i, [static_occupied])
+    # ── 构建跑道占用时间表 ───────────────────────────────────────
+    runway_schedule = build_runway_schedule(flights)
+    print(f"[PPO] Runway schedule: R18L={len(runway_schedule.get('R18L', []))} windows, "
+          f"R18R={len(runway_schedule.get('R18R', []))} windows")
+
+    env_fns = [make_env_fn(G, pos, flights, i,
+                           occupied_ref=[static_occupied],
+                           runway_schedule=runway_schedule)
                for i in range(n_envs)]
     from stable_baselines3.common.vec_env import DummyVecEnv
     vec_env = DummyVecEnv(env_fns)
@@ -226,25 +232,23 @@ def dijkstra_with_conflict_penalty(G: nx.Graph, src: str, dst: str,
 
 
 def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
-                    flight: dict, occupied: dict) -> dict:
+                    flight: dict, occupied: dict,
+                    runway_schedule: dict = None) -> dict:
     """
     用训练好的模型为单架飞机执行推理，返回路径和指标。
-    快速模式：最多走 1500 步，超过或检测到死循环则直接 Dijkstra 补全。
-
-    修复：原代码在循环检测分支对 path 赋值后，被后续
-    `path = env.path_taken[:]` 无条件覆盖，截断逻辑完全失效。
-    现将截断状态用 early_stop_path 单独保存。
     """
     from airport_graph import get_restricted_graph as _get_rest
     Gr = _get_rest(G)
 
-    env = TaxiEnv(G, pos, flight, occupied_positions=occupied)
+    env = TaxiEnv(G, pos, flight,
+                  occupied_positions=occupied,
+                  runway_schedule=runway_schedule or {})
     obs, _ = env.reset()
     done = False
     step = 0
     visit_count = {}
-    MAX_VISIT = 3   # 同一节点最多经过3次，超过则认为陷入死循环
-    early_stop_path = None  # 循环检测触发时保存截断后的路径
+    MAX_VISIT = 3
+    early_stop_path = None
 
     while not done and step < 1500:
         action, _ = model.predict(obs, deterministic=True)
@@ -257,28 +261,23 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
         if node == flight['end_node']:
             break
 
-        # 检测循环：重访次数超限时截断路径，交由 Dijkstra 补全
         if visit_count.get(node, 0) > MAX_VISIT:
-            # 找到该节点第一次出现的位置，截断多余的绕圈部分
             path_so_far = env.path_taken[:]
             if node in path_so_far:
                 first_idx = path_so_far.index(node)
                 early_stop_path = path_so_far[:first_idx + 1]
             else:
                 early_stop_path = path_so_far
-            done = True  # 强制退出推理循环
+            done = True
             break
 
-    # 确定当前已走路径
     if early_stop_path is not None:
         path = early_stop_path
-        # 同步 env.current_node 以便后续 Dijkstra 从正确节点补全
         current_node_for_completion = path[-1]
     else:
         path = env.path_taken[:]
         current_node_for_completion = env.current_node
 
-    # 如果没到终点，用 Dijkstra 补全剩余路径
     if current_node_for_completion != flight['end_node']:
         src = current_node_for_completion
         dst = flight['end_node']
@@ -295,7 +294,6 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
             except Exception:
                 path.append(flight['end_node'])
 
-    # 去除重复节点（保持顺序）
     seen, clean_path = set(), []
     for n in path:
         if n not in seen:
@@ -324,20 +322,24 @@ def run_ppo(G: nx.Graph, flights: list, pos: dict,
     model_file = MODEL_PATH + ".zip"
     if os.path.exists(model_file) and not force_retrain:
         print(f"[PPO] Loading existing model from {model_file}")
-        # 需要一个 dummy env 来加载
         dummy_fl = flights[0]
         dummy_env = TaxiEnv(G, pos, dummy_fl)
         model = PPO.load(MODEL_PATH, env=dummy_env)
     else:
         model = train_ppo(G, pos, flights, total_timesteps=total_timesteps)
 
-    # 顺序推理：每架飞机规划完后更新 occupied
+    # 构建跑道占用时间表（推理阶段同样需要）
+    from flight_data import build_runway_schedule
+    runway_schedule = build_runway_schedule(flights)
+
+    # 顺序推理
     results = []
     occupied = {}
 
     print("[PPO] Running inference for all flights...")
     for i, fl in enumerate(flights):
-        res = _rollout_single(model, G, pos, fl, occupied)
+        res = _rollout_single(model, G, pos, fl, occupied,
+                              runway_schedule=runway_schedule)
         results.append(res)
         # 更新 occupied
         new_occ = _build_occupied([res], pos)
