@@ -16,15 +16,11 @@ from flight_data import (CARBON_FACTOR, ACCEL_FACTOR, MAX_SPEED,
 from airport_graph import FORBIDDEN_NODES, get_restricted_graph
 from dijkstra_solver import compute_flight_metrics, _angle_at_node
 
-# ─── PPO 奖励权重 ───────────────────────────────────
-# 原始参数：W_TIME=-0.005, W_CARBON=-0.020, W_PROGRESS=2.0
-# 问题：时间惩罚与进度奖励量级不匹配，导致策略倾向于就近绕圈
-# 而非积极向目标推进；碳排放惩罚过强会与时间惩罚双重叠加
-W_TIME     = -0.002   # 降低时间惩罚（原-0.005），避免与进度奖励相互抵消
-W_CARBON   = -0.010   # 降低碳排放惩罚（原-0.020），减少与时间惩罚的重复叠加
-W_SAFE     = -2.000   # 安全距离惩罚系数不变
-W_PROGRESS =  3.000   # 增强进度奖励（原2.0），使向目标推进的信号更强
-W_SMOOTH   =  0.200   # 新增：路径平滑奖励，奖励直行、惩罚大角度转弯
+# ─── PPO 奖励权重（推荐初始值） ───────────────
+W_TIME     = -0.005   # 每秒时间惩罚
+W_CARBON   = -0.020   # 每 kg CO2 惩罚
+W_SAFE     = -2.000   # 安全距离奖励（惩罚）系数
+W_PROGRESS =  2.000   # 进度奖励系数
 
 MAX_STEPS  = 3000     # 单 episode 最大步数
 MAX_NEIGHBORS = 8     # 最大邻居数（动作空间上界）
@@ -160,11 +156,8 @@ class TaxiEnv(gym.Env):
             self.done_flag = True
             return self._get_obs(), -50.0, True, False, {'reason': 'dead_end'}
 
-        # 动作映射：取模映射到有效邻居范围
-        # 原clip方案会使所有超出范围的action都映射到最后一个邻居，
-        # 造成该邻居被系统性过选。改用取模可均匀分散映射，
-        # 消除动作分布偏斜，同时保持与action_space.Discrete(max_neighbors)的兼容性。
-        action = int(action) % len(nbs)
+        # 动作裁剪：clip 到有效邻居范围，避免取模导致的动作分布偏斜
+        action = min(int(action), len(nbs) - 1)
         next_node = nbs[action]
 
         # ── 运动物理 ───────────────────────────
@@ -247,20 +240,7 @@ class TaxiEnv(gym.Env):
         r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
         self.prev_dist = new_dist
 
-        # 5. 路径平滑奖励（新增）
-        # 直行(angle≈0)得正奖励，大角度转弯(angle>90)得负奖励
-        # 归一化到[-1, 1]：cos(angle)=1直行, cos(angle)=-1 U形
-        if len(self.path_taken) >= 2 and angle >= 0.0:
-            r_smooth = W_SMOOTH * np.cos(np.radians(angle))
-        else:
-            r_smooth = 0.0
-
-        # 6. 循环惩罚（新增）
-        # 每次重访已走过节点额外扣分，抑制绕圈行为
-        visit_cnt = self.path_taken.count(next_node)  # 含本次
-        r_loop = -1.0 * max(0, visit_cnt - 1)  # 首次=0, 重复1次=-1, 重复2次=-2 ...
-
-        reward = r_time + r_carbon + r_safe + r_progress + r_smooth + r_loop
+        reward = r_time + r_carbon + r_safe + r_progress
 
         # 更新状态
         self.current_node = next_node
@@ -273,6 +253,7 @@ class TaxiEnv(gym.Env):
         info = {}
 
         if self.current_node == self.goal:
+            # efficiency = self.init_dist / max(self.traveled_dist, 1.0)
             reward += 200.0  # 到达奖励
             terminated = True
             info['reason'] = 'reached_goal'
