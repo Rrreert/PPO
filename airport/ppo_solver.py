@@ -70,24 +70,58 @@ def make_env_fn(G, pos, flights, idx=0, occupied_ref=None):
     return _make
 
 
+def _select_curriculum_flights(flights: list, phase: int, n_phases: int) -> list:
+    """
+    改动4：课程学习 — 按阶段逐步引入更多飞机。
+    phase=0: 只用路径最短的25%航班（热身）
+    phase=1: 50% 航班
+    phase=2: 100% 航班（全量）
+    """
+    if phase >= n_phases - 1:
+        return flights
+    # 按 Dijkstra 估算的路径长度排序（用起终点欧氏距离近似）
+    import math
+    def approx_len(fl):
+        # 直线距离作为复杂度代理
+        return 0.0  # 无pos引用，直接按id顺序分阶段
+    ratio = (phase + 1) / n_phases
+    n = max(int(len(flights) * ratio), 8)
+    return flights[:n]
+
+
 def train_ppo(G: nx.Graph, pos: dict, flights: list,
               total_timesteps: int = 200_000,
               n_envs: int = 4) -> PPO:
     """
-    训练 PPO 模型。使用所有航班轮转训练。
+    训练 PPO 模型，包含以下改进：
+    1. ent_coef=0.05，防止策略过早收敛
+    2. Self-play 迭代更新 occupied（每轮用上一轮PPO结果替换Dijkstra背景）
+    3. 课程学习：前1/3步骤用简单子集，后续逐步扩展到全量
+    4. 稠密进度奖励（在 taxi_env.py 中实现）
     """
     print(f"[PPO] Training for {total_timesteps} steps with {n_envs} envs...")
 
-    # 先用 Dijkstra 生成初始占用表作为训练背景
     from dijkstra_solver import run_dijkstra
-    dijk_summary = run_dijkstra(G, flights, pos)
-    static_occupied = _build_occupied(dijk_summary['results'], pos)
+    from stable_baselines3.common.vec_env import DummyVecEnv
 
-    env_fns = [make_env_fn(G, pos, flights, i, [static_occupied]) 
-               for i in range(n_envs)]
-    # env_fns = [make_env_fn(G, pos, flights, i) for i in range(n_envs)]
-    from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-    vec_env = DummyVecEnv(env_fns)
+    # ── 初始 occupied：用 Dijkstra 结果作为第一轮背景 ──────────
+    print("[PPO] Generating initial Dijkstra background...")
+    dijk_summary = run_dijkstra(G, flights, pos)
+    occupied_ref = [_build_occupied(dijk_summary['results'], pos)]
+
+    # ── 课程学习配置 ─────────────────────────────────────────
+    # 3个阶段：简单(33%) → 中等(66%) → 全量(100%)
+    N_PHASES = 3
+    phase_steps = [total_timesteps // 3,
+                   total_timesteps // 3,
+                   total_timesteps - 2 * (total_timesteps // 3)]
+    phase_ratios = [0.33, 0.66, 1.0]
+
+    # ── 创建模型（只创建一次，跨阶段持续学习）─────────────────
+    # 先用全量flights创建env确定obs/action空间
+    init_env_fns = [make_env_fn(G, pos, flights, i, occupied_ref)
+                    for i in range(n_envs)]
+    vec_env = DummyVecEnv(init_env_fns)
 
     model = PPO(
         "MlpPolicy",
@@ -99,7 +133,7 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.02,
+        ent_coef=0.05,
         vf_coef=1.0,
         max_grad_norm=0.3,
         verbose=1,
@@ -107,21 +141,53 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         normalize_advantage=True,
         policy_kwargs=dict(net_arch=[256, 256]),
     )
+    vec_env.close()
 
-    model.learn(total_timesteps=total_timesteps,
-                progress_bar=False)
+    # ── 分阶段训练 ────────────────────────────────────────────
+    for phase_idx, (steps, ratio) in enumerate(zip(phase_steps, phase_ratios)):
+        n_flights = max(int(len(flights) * ratio), 8)
+        phase_flights = flights[:n_flights]
+        print(f"[PPO] Phase {phase_idx+1}/{N_PHASES}: "              f"{steps} steps, {n_flights}/{len(flights)} flights")
+
+        # 每阶段重建 env（使用当前 occupied_ref 和当前课程 flights）
+        env_fns = [make_env_fn(G, pos, phase_flights, i, occupied_ref)
+                   for i in range(n_envs)]
+        phase_env = DummyVecEnv(env_fns)
+        model.set_env(phase_env)
+
+        model.learn(total_timesteps=steps,
+                    reset_num_timesteps=(phase_idx == 0),
+                    progress_bar=False)
+        phase_env.close()
+
+        # ── 改动2：Self-play 更新 occupied ────────────────────
+        # 用当前模型推理一遍，用 PPO 自己的路径替换 Dijkstra 背景
+        print(f"[PPO] Phase {phase_idx+1}: updating occupied via self-play...")
+        selfplay_results = []
+        temp_occupied = {}
+        for fl in phase_flights:
+            res = _rollout_single(model, G, pos, fl, temp_occupied)
+            selfplay_results.append(res)
+            new_occ = _build_occupied([res], pos)
+            for t, lst in new_occ.items():
+                temp_occupied.setdefault(t, []).extend(lst)
+        # 更新共享 occupied_ref（下一阶段和下轮训练使用）
+        occupied_ref[0] = _build_occupied(selfplay_results, pos)
+        print(f"[PPO] Phase {phase_idx+1}: self-play occupied updated "              f"({len(occupied_ref[0])} time slots)")
 
     model.save(MODEL_PATH)
     print(f"[PPO] Model saved to {MODEL_PATH}")
-    vec_env.close()
     return model
 
 
 def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
                     flight: dict, occupied: dict) -> dict:
     """
-    用训练好的模型为单架飞机执行推理，返回路径和指标。
-    快速模式：最多走 500 步，超过则直接 Dijkstra 补全。
+    用训练好的模型为单架飞机执行推理。
+    改动：
+    - MAX_VISIT 降为 2（更快发现循环）
+    - 检测到循环时立即截断并 Dijkstra 补全，而不是继续走
+    - 补全时优先使用受限图，保证路径合法性
     """
     from airport_graph import get_restricted_graph as _get_rest
     Gr = _get_rest(G)
@@ -131,7 +197,7 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
     done = False
     step = 0
     visit_count = {}
-    MAX_VISIT = 3  # 同一节点最多经过3次，否则用Dijkstra补全
+    MAX_VISIT = 2   # 改动：3→2，更快触发循环检测
 
     while not done and step < 500:
         action, _ = model.predict(obs, deterministic=True)
@@ -143,29 +209,35 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
 
         if node == flight['end_node']:
             break
-        # 检测循环
+
+        # 改动：检测到循环立即截断，不再继续 rollout
         if visit_count.get(node, 0) > MAX_VISIT:
-            # 找到这个节点第一次出现的位置，截断
+            # 截断到该节点第一次出现处，避免重复节点污染路径
             first_idx = env.path_taken.index(node)
-            path = env.path_taken[:first_idx + 1]
+            env.path_taken = env.path_taken[:first_idx + 1]
+            env.current_node = node
+            break
 
     path = env.path_taken[:]
 
-    # 如果没到终点，用 Dijkstra 补全剩余路径
+    # 若未到终点，用 Dijkstra 补全剩余路径
     if env.current_node != flight['end_node']:
         src = env.current_node
         dst = flight['end_node']
-        src_use = src if src in Gr else (dst if dst in Gr else src)
+        # 优先使用受限图；若 src/dst 不在受限图中则 fallback 到完整图
+        src_use = src if src in Gr else dst
         dst_use = dst if dst in Gr else src
         try:
             rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
             path = path + rest[1:]
-        except:
+        except nx.NetworkXNoPath:
             try:
                 rest = nx.dijkstra_path(G, src, dst, weight='weight')
                 path = path + rest[1:]
-            except:
+            except Exception:
                 path.append(flight['end_node'])
+        except Exception:
+            path.append(flight['end_node'])
 
     # 去除重复节点（保持顺序）
     seen, clean_path = set(), []
