@@ -75,19 +75,103 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
               n_envs: int = 4) -> PPO:
     """
     训练 PPO 模型。使用所有航班轮转训练。
+
+    关键改动：
+    1. 用 Dijkstra 结果预填充 occupied，让训练期间环境就能看到多机冲突
+    2. 增加 EntropyScheduleCallback，防止 entropy 过早坍缩
+    3. 扩大网络容量至 [256,256,128]，增强对复杂场景的表达力
+    4. 降低 ent_coef 初始值，配合回调动态调整
     """
     print(f"[PPO] Training for {total_timesteps} steps with {n_envs} envs...")
 
-    # 先用 Dijkstra 生成初始占用表作为训练背景
+    # ── 预填充 occupied（训练/推理分布对齐）────────────────────────
+    # 原问题：训练时 occupied 为空，策略从未在密集冲突场景下被训练，
+    # 导致推理时面对 137 架并发时冲突激增。
+    # 修复：用 Dijkstra 基线路径预先构建 occupied 作为训练背景。
     from dijkstra_solver import run_dijkstra
     dijk_summary = run_dijkstra(G, flights, pos)
     static_occupied = _build_occupied(dijk_summary['results'], pos)
+    print(f"[PPO] Pre-filled occupied table: {len(static_occupied)} time slots")
 
-    env_fns = [make_env_fn(G, pos, flights, i, [static_occupied]) 
+    env_fns = [make_env_fn(G, pos, flights, i, [static_occupied])
                for i in range(n_envs)]
-    # env_fns = [make_env_fn(G, pos, flights, i) for i in range(n_envs)]
-    from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+    from stable_baselines3.common.vec_env import DummyVecEnv
     vec_env = DummyVecEnv(env_fns)
+
+    # ── Entropy 调度回调 ──────────────────────────────────────────
+    # 原问题：entropy 在约前 1/4 训练后就停在 -1.5 附近不再下降，
+    # 剩余 200 万步在强化一个次优策略。
+    # 修复：监控 entropy，当它停止下降超过 patience 步时，
+    # 短暂提升 ent_coef 重新注入探索性，避免陷入局部最优。
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class EntropyScheduleCallback(BaseCallback):
+        """
+        动态 entropy 调度：
+        - 记录近期 entropy 均值
+        - 若连续 patience 次迭代 entropy 提升不足 threshold，
+          将 ent_coef 提升至 boost_value 持续 boost_steps 步后恢复
+        """
+        def __init__(self, patience=30, threshold=0.01,
+                     boost_value=0.05, boost_steps=20, verbose=0):
+            super().__init__(verbose)
+            self.patience = patience
+            self.threshold = threshold
+            self.boost_value = boost_value
+            self.boost_steps = boost_steps
+            self._entropy_history = []
+            self._stagnant_count = 0
+            self._boosting = 0          # 剩余 boost 迭代数
+            self._base_ent_coef = None  # 恢复用的原始值
+
+        def _on_step(self) -> bool:
+            return True
+
+        def _on_rollout_end(self) -> None:
+            # 从 logger 读取当前 entropy（SB3 内部 key）
+            ent = self.logger.name_to_value.get('train/entropy_loss', None)
+            if ent is None:
+                return
+
+            self._entropy_history.append(ent)
+
+            if self._boosting > 0:
+                self._boosting -= 1
+                if self._boosting == 0:
+                    # 恢复原始 ent_coef
+                    self.model.ent_coef = self._base_ent_coef
+                    if self.verbose:
+                        print(f"[EntropySchedule] Restored ent_coef={self._base_ent_coef:.4f}")
+                return
+
+            if len(self._entropy_history) < self.patience:
+                return
+
+            recent = self._entropy_history[-self.patience:]
+            # entropy 是负值，越接近 0 表示越均匀（探索越充分）
+            # 若近期均值几乎不变（变化 < threshold），说明已停滞
+            improvement = abs(recent[-1] - recent[0])
+            if improvement < self.threshold:
+                self._stagnant_count += 1
+                if self._stagnant_count >= 2:
+                    self._base_ent_coef = self.model.ent_coef
+                    self.model.ent_coef = self.boost_value
+                    self._boosting = self.boost_steps
+                    self._stagnant_count = 0
+                    if self.verbose:
+                        print(f"[EntropySchedule] Entropy stagnant, "
+                              f"boosting ent_coef to {self.boost_value} "
+                              f"for {self.boost_steps} iters")
+            else:
+                self._stagnant_count = 0
+
+    entropy_cb = EntropyScheduleCallback(
+        patience=40,       # 观察窗口（iterations）
+        threshold=0.008,   # 低于此改善量视为停滞
+        boost_value=0.06,  # boost 期间的 ent_coef
+        boost_steps=25,    # boost 持续迭代数
+        verbose=1,
+    )
 
     model = PPO(
         "MlpPolicy",
@@ -105,10 +189,11 @@ def train_ppo(G: nx.Graph, pos: dict, flights: list,
         verbose=1,
         tensorboard_log=None,
         normalize_advantage=True,
-        policy_kwargs=dict(net_arch=[256, 256]),
+        policy_kwargs=dict(net_arch=[256, 256, 128]),
     )
 
     model.learn(total_timesteps=total_timesteps,
+                callback=entropy_cb,
                 progress_bar=False)
 
     model.save(MODEL_PATH)
@@ -144,7 +229,11 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
                     flight: dict, occupied: dict) -> dict:
     """
     用训练好的模型为单架飞机执行推理，返回路径和指标。
-    快速模式：最多走 1500 步，超过则直接 Dijkstra 补全。
+    快速模式：最多走 1500 步，超过或检测到死循环则直接 Dijkstra 补全。
+
+    修复：原代码在循环检测分支对 path 赋值后，被后续
+    `path = env.path_taken[:]` 无条件覆盖，截断逻辑完全失效。
+    现将截断状态用 early_stop_path 单独保存。
     """
     from airport_graph import get_restricted_graph as _get_rest
     Gr = _get_rest(G)
@@ -154,7 +243,8 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
     done = False
     step = 0
     visit_count = {}
-    MAX_VISIT = 3  # 同一节点最多经过3次，否则用Dijkstra补全
+    MAX_VISIT = 3   # 同一节点最多经过3次，超过则认为陷入死循环
+    early_stop_path = None  # 循环检测触发时保存截断后的路径
 
     while not done and step < 1500:
         action, _ = model.predict(obs, deterministic=True)
@@ -166,31 +256,43 @@ def _rollout_single(model: PPO, G: nx.Graph, pos: dict,
 
         if node == flight['end_node']:
             break
-        # 检测循环
-        if visit_count.get(node, 0) > MAX_VISIT:
-            # 找到这个节点第一次出现的位置，截断
-            first_idx = env.path_taken.index(node)
-            path = env.path_taken[:first_idx + 1]
 
-    path = env.path_taken[:]
+        # 检测循环：重访次数超限时截断路径，交由 Dijkstra 补全
+        if visit_count.get(node, 0) > MAX_VISIT:
+            # 找到该节点第一次出现的位置，截断多余的绕圈部分
+            path_so_far = env.path_taken[:]
+            if node in path_so_far:
+                first_idx = path_so_far.index(node)
+                early_stop_path = path_so_far[:first_idx + 1]
+            else:
+                early_stop_path = path_so_far
+            done = True  # 强制退出推理循环
+            break
+
+    # 确定当前已走路径
+    if early_stop_path is not None:
+        path = early_stop_path
+        # 同步 env.current_node 以便后续 Dijkstra 从正确节点补全
+        current_node_for_completion = path[-1]
+    else:
+        path = env.path_taken[:]
+        current_node_for_completion = env.current_node
 
     # 如果没到终点，用 Dijkstra 补全剩余路径
-    if env.current_node != flight['end_node']:
-        src = env.current_node
+    if current_node_for_completion != flight['end_node']:
+        src = current_node_for_completion
         dst = flight['end_node']
-        src_use = src if src in Gr else (dst if dst in Gr else src)
+        src_use = src if src in Gr else dst
         dst_use = dst if dst in Gr else src
-        t_current = env.t_global  # 取当前仿真时刻，用于冲突判断
+        t_current = env.t_global
         try:
-            # rest = nx.dijkstra_path(Gr, src_use, dst_use, weight='weight')
             rest = dijkstra_with_conflict_penalty(Gr, src_use, dst_use, occupied, t_current, pos)
             path = path + rest[1:]
-        except:
+        except Exception:
             try:
-                # rest = nx.dijkstra_path(G, src, dst, weight='weight')
                 rest = dijkstra_with_conflict_penalty(G, src, dst, occupied, t_current, pos)
                 path = path + rest[1:]
-            except:
+            except Exception:
                 path.append(flight['end_node'])
 
     # 去除重复节点（保持顺序）
