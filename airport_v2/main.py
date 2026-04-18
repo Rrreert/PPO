@@ -3,8 +3,8 @@ main.py
 主程序：构建图 → Dijkstra → 训练PPO → 推理 → 可视化对比
 """
 import os, sys, time
-os.chdir("/kaggle/working/PPO/airport/")
-sys.path.insert(0, "/kaggle/working/PPO/airport/")
+os.chdir("/kaggle/working/PPO/airport_v2/")
+sys.path.insert(0, "/kaggle/working/PPO/airport_v2/")
 
 import numpy as np
 import warnings
@@ -77,15 +77,15 @@ def main():
     # ── 6. 可视化 ─────────────────────────────
     print("\n[Step 5] Generating visualizations...")
     generate_full_report(dijk_summary, ppo_summary, G, pos,
-                         output_path="/kaggle/working/PPO/airport/taxi_comparison_report.png")
+                         output_path="/kaggle/working/PPO/airport_v2/taxi_comparison_report.png")
     generate_route_detail(dijk_summary, G, pos,
-                          output_path="/kaggle/working/PPO/airport/dijkstra_routes.png",
+                          output_path="/kaggle/working/PPO/airport_v2/dijkstra_routes.png",
                           title_prefix="Dijkstra")
     generate_route_detail(ppo_summary, G, pos,
-                          output_path="/kaggle/working/PPO/airport/ppo_routes.png",
+                          output_path="/kaggle/working/PPO/airport_v2/ppo_routes.png",
                           title_prefix="PPO")
 
-    print("\n[Done] All outputs saved to /kaggle/working/PPO/airport/")
+    print("\n[Done] All outputs saved to /kaggle/working/PPO/airport_v2/")
     return dijk_summary, ppo_summary
 
 

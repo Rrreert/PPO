@@ -247,6 +247,6 @@ def euclidean(pos, u, v):
 
 if __name__ == "__main__":
     import os
-    os.chdir("/kaggle/working/PPO/airport/")
+    os.chdir("/kaggle/working/PPO/airport_v2/")
     G, pos = build_graph("虹桥点.csv")
     print("Sample edges:", list(G.edges(data=True))[:3])
