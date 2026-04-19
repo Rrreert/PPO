@@ -192,17 +192,25 @@ class TaxiEnv(gym.Env):
 
         if is_turn:
             R = 30.0
-            t_turn_extra = (np.pi * R * angle / 180.0 / TURN_SPEED +
-                            (MAX_SPEED - TURN_SPEED) / ACCEL)
+            # 与 dijkstra_solver.py 保持一致：
+            # t_arc    = 转弯弧行时间（以 TURN_SPEED 匀速走弧长）
+            # t_recover = 转弯后从 TURN_SPEED 恢复到 MAX_SPEED 的加速时间
+            t_arc     = np.pi * R * angle / 180.0 / TURN_SPEED
+            t_recover = (MAX_SPEED - TURN_SPEED) / ACCEL
+            t_turn_extra = t_arc + t_recover
         else:
+            t_arc, t_recover = 0.0, 0.0
             t_turn_extra = 0.0
 
         dt_seg = t_accel + t_cruise + t_turn_extra
 
-        # CO2
+        # CO2：与 dijkstra_solver.py 对齐
+        #   加减速段、转弯弧行段、加速恢复段 → 均用 ACCEL_FACTOR
+        #   匀速巡航段 → 用基础燃油率
         co2_seg = (self.flight['fuel_rate'] * ACCEL_FACTOR * CARBON_FACTOR * t_accel +
                    self.flight['fuel_rate'] * CARBON_FACTOR * t_cruise +
-                   self.flight['fuel_rate'] * ACCEL_FACTOR * CARBON_FACTOR * t_turn_extra)
+                   self.flight['fuel_rate'] * ACCEL_FACTOR * CARBON_FACTOR * t_arc +
+                   self.flight['fuel_rate'] * ACCEL_FACTOR * CARBON_FACTOR * t_recover)
 
         self.speed = v_target
         self.elapsed_time += dt_seg
