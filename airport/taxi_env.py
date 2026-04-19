@@ -106,6 +106,7 @@ class TaxiEnv(gym.Env):
         # self.traveled_dist = 0.0
         self.done_flag = False
         self.t_global = self.flight['actual_time']
+        self.prev_min_conf_dist = float('inf')  # 上一步检测到的最近冲突距离（用于本步强制减速）
 
     def _get_obs(self):
         cx, cy = self._norm_xy(self.current_node)
@@ -176,6 +177,15 @@ class TaxiEnv(gym.Env):
         is_turn = angle > 20.0
         v_target = TURN_SPEED if is_turn else MAX_SPEED
 
+        # ── 强制减速：上一步检测到预警距离内有冲突时压低速度 ──
+        # 使用上一步的 prev_min_conf_dist，确保"感知在先、减速在后"的因果顺序
+        if self.prev_min_conf_dist < D_SAFE:
+            # 线性插值：距离从 D_SAFE 缩短到 D_MIN 时，限速从 TURN_SPEED 降到接近 0
+            danger_ratio = 1.0 - (self.prev_min_conf_dist - D_MIN) / max(D_SAFE - D_MIN, 1.0)
+            danger_ratio = np.clip(danger_ratio, 0.0, 1.0)
+            v_conflict_cap = TURN_SPEED * (1.0 - 0.8 * danger_ratio)  # [TURN_SPEED, TURN_SPEED*0.2]
+            v_target = min(v_target, v_conflict_cap)
+
         # 段距离
         seg_len = np.linalg.norm(
             np.array(self.pos.get(next_node, (0,0))) -
@@ -226,6 +236,9 @@ class TaxiEnv(gym.Env):
                 d = np.linalg.norm(cur_xy - np.array(occ_xy))
                 if d < min_dist:
                     min_dist = d
+
+        # 更新供下一步使用的冲突距离
+        self.prev_min_conf_dist = min_dist
 
         # ── 奖励计算 ───────────────────────────
         # 1. 时间奖励
