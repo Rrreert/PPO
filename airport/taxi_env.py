@@ -16,12 +16,11 @@ from flight_data import (CARBON_FACTOR, ACCEL_FACTOR, MAX_SPEED,
 from airport_graph import FORBIDDEN_NODES, get_restricted_graph
 from dijkstra_solver import compute_flight_metrics, _angle_at_node
 
-# ─── PPO 奖励权重 ────────────────────────────
+# ─── PPO 奖励权重（推荐初始值） ───────────────
 W_TIME     = -0.005   # 每秒时间惩罚
 W_CARBON   = -0.020   # 每 kg CO2 惩罚
-W_SAFE     = -2.000   # 安全距离惩罚系数
-W_PROGRESS =  5.000   # 进度奖励系数（↑ 从2.0提高到5.0，加强稠密引导）
-W_STEP     = -0.050   # 每步固定惩罚（↑ 新增，防止绕路拖延）
+W_SAFE     = -2.000   # 安全距离奖励（惩罚）系数
+W_PROGRESS =  2.000   # 进度奖励系数
 
 MAX_STEPS  = 3000     # 单 episode 最大步数
 MAX_NEIGHBORS = 8     # 最大邻居数（动作空间上界）
@@ -70,16 +69,6 @@ class TaxiEnv(gym.Env):
         # 最大可能距离（归一化用）
         self.max_dist = self.xy_scale * 2
 
-        # ── 预计算 Dijkstra 最短路距离，用于稠密进度奖励 ──
-        # 从终点出发做单源最短路，得到"每个节点→终点"的图距离
-        self._dijk_dist_cache: dict = {}
-        try:
-            lengths = nx.single_source_dijkstra_path_length(
-                self.G_restricted, self.flight['end_node'], weight='weight')
-            self._dijk_dist_cache = dict(lengths)
-        except Exception:
-            pass  # 图不连通时退化为欧氏距离
-
         self._reset_state()
 
     def _norm_xy(self, node):
@@ -89,9 +78,7 @@ class TaxiEnv(gym.Env):
         return (x - self.x_min) / self.xy_scale, (y - self.y_min) / self.xy_scale
 
     def _dist_to_goal(self, node):
-        # 优先使用预计算的图距离（更准确），fallback到欧氏距离
-        if node in self._dijk_dist_cache:
-            return self._dijk_dist_cache[node]
+        # Use Euclidean heuristic for speed (avoid repeated Dijkstra)
         if node not in self.pos or self.goal not in self.pos:
             return self.max_dist
         return np.linalg.norm(
@@ -233,16 +220,13 @@ class TaxiEnv(gym.Env):
                     min_dist = d
 
         # ── 奖励计算 ───────────────────────────
-        # 1. 时间惩罚
+        # 1. 时间奖励
         r_time = W_TIME * dt_seg
 
-        # 2. 碳排放惩罚
+        # 2. 碳排放奖励
         r_carbon = W_CARBON * co2_seg
 
-        # 3. 每步固定惩罚（防止绕路拖延）
-        r_step = W_STEP
-
-        # 4. 安全惩罚
+        # 3. 安全奖励
         if min_dist < D_MIN:
             r_safe = W_SAFE * (D_MIN / max(min_dist, 1e-3)) ** 2
         elif min_dist < D_SAFE:
@@ -251,13 +235,12 @@ class TaxiEnv(gym.Env):
         else:
             r_safe = 0.0
 
-        # 5. 稠密进度奖励（基于图距离差，归一化到初始图距离）
+        # 4. 进度奖励
         new_dist = self._dist_to_goal(next_node)
-        init_dist = max(self._dijk_dist_cache.get(self.flight["start_node"], self.max_dist), 1.0)
-        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / init_dist
+        r_progress = W_PROGRESS * (self.prev_dist - new_dist) / self.max_dist
         self.prev_dist = new_dist
 
-        reward = r_time + r_carbon + r_step + r_safe + r_progress
+        reward = r_time + r_carbon + r_safe + r_progress
 
         # 更新状态
         self.current_node = next_node
